@@ -137,10 +137,12 @@ impl CacheDB {
 
     /// Remove all cache entries for files in a directory and the directory record itself.
     pub fn remove_dir(&self, dir_path: &str) -> rusqlite::Result<()> {
-        // Remove files: "dir_path/%" matches all files in the directory
-        let pattern = format!("{}/%", dir_path);
+        // Use exact prefix match with escaped LIKE pattern to avoid matching sibling dirs
+        // e.g., "March" should not match "March 2026/photo.jpg"
+        let escaped = dir_path.replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_");
+        let pattern = format!("{}/%", escaped);
         self.conn.execute(
-            "DELETE FROM cache WHERE path LIKE ?1",
+            "DELETE FROM cache WHERE path LIKE ?1 ESCAPE '\\'",
             params![pattern],
         )?;
         self.conn.execute(

@@ -12,6 +12,7 @@ use walkdir::WalkDir;
 
 const PHOTO_EXTENSIONS: &[&str] = &[
     "jpg", "jpeg", "png", "heic", "heif", "dng", "raw", "tiff", "tif", "cr2", "nef", "arw",
+    "aae", "xmp", "mov",
 ];
 
 fn is_photo(path: &Path) -> bool {
@@ -130,6 +131,7 @@ pub fn cache_directory(
 }
 
 /// Evict least-recently-accessed directories until total cache is under the limit.
+/// Skips directories that are protected, have pending writes, or have open file handles.
 pub fn evict_lru(
     cache_dir: &Path,
     db: &CacheDB,
@@ -143,6 +145,13 @@ pub fn evict_lru(
             initial_total as f64 / 1e6, max_cache_bytes as f64 / 1e6
         );
     }
+
+    // Collect dirs that have pending writes — these cannot be evicted
+    let pending = db.all_pending_writes().unwrap_or_default();
+    let dirs_with_pending: std::collections::HashSet<String> = pending.iter()
+        .filter_map(|p| p.split('/').next().map(|s| s.to_string()))
+        .collect();
+
     loop {
         let total = db.total_size().unwrap_or(0);
         if total <= max_cache_bytes {
@@ -154,14 +163,19 @@ pub fn evict_lru(
             Err(_) => break,
         };
 
-        // Find the oldest directory that isn't the one we're protecting
+        // Find the oldest directory that is safe to evict
         let victim = dirs.iter().find(|d| {
-            protect_dir.map_or(true, |p| d.dir_path != p)
+            let is_protected = protect_dir.map_or(false, |p| d.dir_path == p);
+            let has_pending = dirs_with_pending.contains(&d.dir_path);
+            !is_protected && !has_pending
         });
 
         let victim = match victim {
             Some(v) => v,
-            None => break, // Nothing to evict
+            None => {
+                warn!("Cannot evict any directories (all protected or have pending writes)");
+                break;
+            }
         };
 
         info!("Evicting directory: {} ({} bytes)", victim.dir_path, victim.total_size);
@@ -185,13 +199,23 @@ pub fn cleanup_stale_state(nas_path: &Path, cache_dir: &Path, db: &CacheDB) {
         return;
     }
 
-    // 1. Remove directories on disk that aren't tracked in DB
+    // Collect dirs that have pending writes — must not be deleted
+    let pending = db.all_pending_writes().unwrap_or_default();
+    let dirs_with_pending: std::collections::HashSet<String> = pending.iter()
+        .filter_map(|p| p.split('/').next().map(|s| s.to_string()))
+        .collect();
+
+    // 1. Remove directories on disk that aren't tracked in DB (skip dirs with pending writes)
     if let Ok(read_dir) = fs::read_dir(cache_dir) {
         for entry in read_dir.filter_map(|e| e.ok()) {
             if !entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
                 continue;
             }
             let dir_name = entry.file_name().to_string_lossy().to_string();
+            if dirs_with_pending.contains(&dir_name) {
+                debug!("Preserving untracked directory with pending writes: {}", dir_name);
+                continue;
+            }
             if !db.is_dir_cached(&dir_name).unwrap_or(true) {
                 info!("Cleaning up untracked directory: {}", dir_name);
                 let _ = fs::remove_dir_all(entry.path());
@@ -343,8 +367,11 @@ impl WriteFlushWorker {
             loop {
                 thread::sleep(flush_interval);
 
-                let db_guard = db.lock().unwrap();
-                let pending = db_guard.all_pending_writes().unwrap_or_default();
+                // Collect pending paths while holding the lock briefly
+                let pending = {
+                    let db_guard = db.lock().unwrap();
+                    db_guard.all_pending_writes().unwrap_or_default()
+                };
                 if pending.is_empty() {
                     continue;
                 }
@@ -355,6 +382,7 @@ impl WriteFlushWorker {
                     let dst = nas_path.join(rel_path);
 
                     if !src.exists() {
+                        let db_guard = db.lock().unwrap();
                         db_guard.remove_pending_write(rel_path).ok();
                         debug!("Pending write removed (file gone): {}", rel_path);
                         let _ = flushed_tx.send(rel_path.clone());
@@ -365,8 +393,10 @@ impl WriteFlushWorker {
                         fs::create_dir_all(parent).ok();
                     }
 
+                    // Copy without holding the DB lock
                     match fs::copy(&src, &dst) {
                         Ok(size) => {
+                            let db_guard = db.lock().unwrap();
                             db_guard.remove_pending_write(rel_path).ok();
                             info!("Flushed to NAS: {} ({:.1} MB)", rel_path, size as f64 / 1e6);
                             let _ = flushed_tx.send(rel_path.clone());

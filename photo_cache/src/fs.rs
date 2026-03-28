@@ -35,12 +35,6 @@ fn make_finder_info(color_byte: u8) -> [u8; FINDER_INFO_LEN] {
     info
 }
 
-// Binary plist encoding of ["Yellow\n4"] — cached directory tag
-const YELLOW_TAG_PLIST: &[u8] = &[
-    98, 112, 108, 105, 115, 116, 48, 48, 161, 1, 88, 89, 101, 108, 108, 111, 119, 10,
-    52, 8, 10, 0, 0, 0, 0, 0, 0, 1, 1, 0, 0, 0, 0, 0, 0, 0, 2, 0, 0, 0, 0, 0, 0, 0,
-    0, 0, 0, 0, 0, 0, 0, 0, 19,
-];
 
 // Binary plist encoding of ["Green\n6"] — file cached locally
 const GREEN_TAG_PLIST: &[u8] = &[
@@ -309,8 +303,11 @@ impl PhotoCacheFS {
 
         let atime = meta.accessed().unwrap_or(UNIX_EPOCH);
         let mtime = meta.modified().unwrap_or(UNIX_EPOCH);
-        let ctime = SystemTime::UNIX_EPOCH
-            + Duration::from_secs(meta.ctime() as u64);
+        let ctime = if meta.ctime() >= 0 {
+            SystemTime::UNIX_EPOCH + Duration::from_secs(meta.ctime() as u64)
+        } else {
+            SystemTime::UNIX_EPOCH
+        };
         let crtime = meta.created().unwrap_or(UNIX_EPOCH);
 
         // Ensure owner has rw access (NAS files may be owned by a different uid)
@@ -600,6 +597,8 @@ impl Filesystem for PhotoCacheFS {
         // Trigger background caching of this file's directory
         self.trigger_dir_cache(&rel_path);
 
+        let is_write = flags.0 & libc::O_WRONLY != 0 || flags.0 & libc::O_RDWR != 0;
+
         let resolved = match self.resolve(&rel_path) {
             Some(p) => p,
             None => {
@@ -608,20 +607,45 @@ impl Filesystem for PhotoCacheFS {
             }
         };
 
+        // If writing and file is on NAS (not cached), copy to cache first
+        // so writes go to local disk and get flushed to NAS later
+        let (open_path, is_cached) = if is_write && !resolved.starts_with(&self.cache_dir) {
+            let cache_path = self.cache_dir.join(&rel_path);
+            if let Some(parent) = cache_path.parent() {
+                fs::create_dir_all(parent).ok();
+            }
+            if fs::copy(&resolved, &cache_path).is_ok() {
+                info!("Copied to cache for write: {}", rel_path);
+                // Mark as pending NAS write
+                self.pending_writes.lock().unwrap().insert(rel_path.clone());
+                if let Some(ref db) = self.db {
+                    let db = db.lock().unwrap();
+                    db.add_pending_write(&rel_path).ok();
+                }
+                (cache_path, true)
+            } else {
+                // Fallback: write directly to NAS
+                warn!("Failed to copy to cache for write, using NAS directly: {}", rel_path);
+                (resolved, false)
+            }
+        } else {
+            let is_cached = resolved.starts_with(&self.cache_dir);
+            (resolved, is_cached)
+        };
+
         let file = match OpenOptions::new()
             .read(true)
-            .write(flags.0 & libc::O_WRONLY != 0 || flags.0 & libc::O_RDWR != 0)
-            .open(&resolved)
+            .write(is_write)
+            .open(&open_path)
         {
             Ok(f) => f,
             Err(e) => {
-                error!("Failed to open {:?}: {}", resolved, e);
+                error!("Failed to open {:?}: {}", open_path, e);
                 reply.error(Errno::EIO);
                 return;
             }
         };
 
-        let is_cached = resolved.starts_with(&self.cache_dir);
         let fh = self.alloc_fh();
         self.file_handles
             .lock()
@@ -936,6 +960,12 @@ impl Filesystem for PhotoCacheFS {
         }
 
         self.db_remove(&child_rel);
+        // Clear from pending writes
+        self.pending_writes.lock().unwrap().remove(&child_rel);
+        if let Some(ref db) = self.db {
+            let db = db.lock().unwrap();
+            db.remove_pending_write(&child_rel).ok();
+        }
         info!("  DB: removed");
         self.inodes.lock().unwrap().remove_path(&child_rel);
         reply.ok();
