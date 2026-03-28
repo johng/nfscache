@@ -4,7 +4,7 @@ use fuser::{
     ReplyEmpty, ReplyEntry, ReplyOpen, ReplyStatfs, ReplyWrite, Request, TimeOrNow,
 };
 use libc::{EIO, ENOENT, ENOTEMPTY};
-use log::{debug, error, warn};
+use log::{error, warn};
 use std::collections::HashMap;
 use std::ffi::OsStr;
 use std::fs::{self, File, OpenOptions};
@@ -864,11 +864,11 @@ impl Filesystem for PhotoCacheFS {
         _req: &Request,
         ino: u64,
         mode: Option<u32>,
-        uid: Option<u32>,
-        gid: Option<u32>,
+        _uid: Option<u32>,
+        _gid: Option<u32>,
         size: Option<u64>,
-        atime: Option<TimeOrNow>,
-        mtime: Option<TimeOrNow>,
+        _atime: Option<TimeOrNow>,
+        _mtime: Option<TimeOrNow>,
         _ctime: Option<SystemTime>,
         _fh: Option<u64>,
         _crtime: Option<SystemTime>,
