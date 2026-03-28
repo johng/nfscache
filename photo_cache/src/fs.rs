@@ -2,21 +2,59 @@
 use fuser::{
     BsdFileFlags, Config, Errno, FileAttr, FileHandle, FileType, Filesystem, FopenFlags,
     Generation, INodeNo, LockOwner, MountOption, OpenFlags, ReplyAttr, ReplyCreate, ReplyData,
-    ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyOpen, ReplyStatfs, ReplyWrite, RenameFlags,
-    Request, TimeOrNow, WriteFlags,
+    ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyOpen, ReplyStatfs, ReplyWrite, ReplyXattr,
+    RenameFlags, Request, TimeOrNow, WriteFlags,
 };
-use log::{error, warn};
-use std::collections::HashMap;
+use crate::cache_db::CacheDB;
+use crate::sync::CacheWorker;
+use crate::sync::WriteFlushWorker;
+use log::{debug, error, info, warn};
+use std::collections::{HashMap, HashSet};
 use std::ffi::OsStr;
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-const TTL: Duration = Duration::from_secs(1);
+const TTL: Duration = Duration::from_secs(30);
 const ROOT_INO: u64 = 1;
+const FINDER_TAGS_XATTR: &str = "com.apple.metadata:_kMDItemUserTags";
+const FINDER_INFO_XATTR: &str = "com.apple.FinderInfo";
+const FINDER_INFO_LEN: usize = 32;
+
+// FinderInfo color label values for byte 9: color << 1 (bits 3:1)
+const FINDER_COLOR_GREEN: u8 = 6 << 1;  // 0x0C
+const FINDER_COLOR_YELLOW: u8 = 3 << 1; // 0x06
+const FINDER_COLOR_ORANGE: u8 = 1 << 1; // 0x02
+
+fn make_finder_info(color_byte: u8) -> [u8; FINDER_INFO_LEN] {
+    let mut info = [0u8; FINDER_INFO_LEN];
+    info[9] = color_byte;
+    info
+}
+
+// Binary plist encoding of ["Yellow\n4"] — cached directory tag
+const YELLOW_TAG_PLIST: &[u8] = &[
+    98, 112, 108, 105, 115, 116, 48, 48, 161, 1, 88, 89, 101, 108, 108, 111, 119, 10,
+    52, 8, 10, 0, 0, 0, 0, 0, 0, 1, 1, 0, 0, 0, 0, 0, 0, 0, 2, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 19,
+];
+
+// Binary plist encoding of ["Green\n6"] — file cached locally
+const GREEN_TAG_PLIST: &[u8] = &[
+    98, 112, 108, 105, 115, 116, 48, 48, 161, 1, 87, 71, 114, 101, 101, 110, 10, 54,
+    8, 10, 0, 0, 0, 0, 0, 0, 1, 1, 0, 0, 0, 0, 0, 0, 0, 2, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 18,
+];
+
+// Binary plist encoding of ["Orange\n7"] — pending NAS write tag
+const ORANGE_TAG_PLIST: &[u8] = &[
+    98, 112, 108, 105, 115, 116, 48, 48, 161, 1, 88, 79, 114, 97, 110, 103, 101, 10,
+    55, 8, 10, 0, 0, 0, 0, 0, 0, 1, 1, 0, 0, 0, 0, 0, 0, 0, 2, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 19,
+];
 
 struct InodeMap {
     path_to_ino: HashMap<String, u64>,
@@ -68,6 +106,8 @@ impl InodeMap {
 
 struct OpenFileHandle {
     file: File,
+    /// True if the file handle points to the cache copy (vs NAS directly)
+    is_cached: bool,
 }
 
 pub struct PhotoCacheFS {
@@ -76,16 +116,160 @@ pub struct PhotoCacheFS {
     inodes: Mutex<InodeMap>,
     file_handles: Mutex<HashMap<u64, OpenFileHandle>>,
     next_fh: Mutex<u64>,
+    db: Option<Mutex<CacheDB>>,
+    cache_worker: Option<CacheWorker>,
+    flush_worker: Option<WriteFlushWorker>,
+    /// In-memory set of fully cached directory names for fast lookups.
+    cached_dirs: Mutex<HashSet<String>>,
+    /// In-memory set of files pending NAS write.
+    pending_writes: Mutex<HashSet<String>>,
+    uid: u32,
+    gid: u32,
 }
 
 impl PhotoCacheFS {
-    pub fn new(nas_path: PathBuf, cache_dir: PathBuf) -> Self {
+    pub fn new(
+        nas_path: PathBuf,
+        cache_dir: PathBuf,
+        db: Option<CacheDB>,
+        cache_worker: Option<CacheWorker>,
+        flush_worker: Option<WriteFlushWorker>,
+    ) -> Self {
+        let uid = unsafe { libc::getuid() };
+        let gid = unsafe { libc::getgid() };
+
+        // Pre-load cached directory names and pending writes from DB
+        let mut initial_dirs = HashSet::new();
+        let mut initial_pending = HashSet::new();
+        if let Some(ref db) = db {
+            if let Ok(dirs) = db.lru_directories() {
+                for d in dirs {
+                    initial_dirs.insert(d.dir_path);
+                }
+            }
+            if let Ok(pending) = db.all_pending_writes() {
+                for p in pending {
+                    initial_pending.insert(p);
+                }
+            }
+        }
+
         PhotoCacheFS {
             nas_path,
             cache_dir,
             inodes: Mutex::new(InodeMap::new()),
             file_handles: Mutex::new(HashMap::new()),
             next_fh: Mutex::new(1),
+            db: db.map(Mutex::new),
+            cache_worker,
+            flush_worker,
+            cached_dirs: Mutex::new(initial_dirs),
+            pending_writes: Mutex::new(initial_pending),
+            uid,
+            gid,
+        }
+    }
+
+    /// Check if an individual file exists in the local cache.
+    fn is_file_cached(&self, rel_path: &str) -> bool {
+        if rel_path.is_empty() || !rel_path.contains('/') {
+            return false;
+        }
+        self.cache_dir.join(rel_path).exists()
+    }
+
+    /// Check if a file has a pending write (not yet synced to NAS).
+    fn is_pending_write(&self, rel_path: &str) -> bool {
+        self.pending_writes.lock().unwrap().contains(rel_path)
+    }
+
+    /// Check if a path is fully cached locally.
+    /// Uses in-memory set — no DB lock needed.
+    fn is_cached(&self, rel_path: &str) -> bool {
+        if rel_path.is_empty() {
+            return false;
+        }
+        let dirs = self.cached_dirs.lock().unwrap();
+        // Check if this path is itself a cached directory
+        if dirs.contains(rel_path) {
+            return true;
+        }
+        // Check if this file's parent directory is fully cached
+        if let Some(dir) = Self::parent_dir(rel_path) {
+            return dirs.contains(dir);
+        }
+        false
+    }
+
+    /// Extract the top-level directory from a relative path (e.g., "March 2026/IMG.jpg" -> "March 2026")
+    fn parent_dir(rel_path: &str) -> Option<&str> {
+        rel_path.split('/').next().filter(|s| !s.is_empty() && rel_path.contains('/'))
+    }
+
+    /// Trigger background caching of the directory containing this file.
+    fn trigger_dir_cache(&self, rel_path: &str) {
+        // Drain completed cache operations and flushed writes
+        if let Some(ref worker) = self.cache_worker {
+            for dir in worker.drain_completed() {
+                self.cached_dirs.lock().unwrap().insert(dir);
+            }
+        }
+        if let Some(ref flush) = self.flush_worker {
+            let flushed = flush.drain_flushed();
+            if !flushed.is_empty() {
+                let mut pending = self.pending_writes.lock().unwrap();
+                for path in flushed {
+                    pending.remove(&path);
+                }
+            }
+        }
+
+        if let Some(dir) = Self::parent_dir(rel_path) {
+            let already_cached = self.cached_dirs.lock().unwrap().contains(dir);
+            if already_cached {
+                // Touch the dir to update LRU
+                if let Some(ref db) = self.db {
+                    let db = db.lock().unwrap();
+                    let _ = db.touch_dir_access(dir);
+                }
+            } else {
+                debug!("Requesting cache for directory: {}", dir);
+                if let Some(ref worker) = self.cache_worker {
+                    worker.request_cache(dir.to_string());
+                }
+            }
+        }
+    }
+
+    /// Record a file in the cache DB (if DB is available).
+    fn db_add(&self, rel_path: &str, size: u64, mtime: f64) {
+        if let Some(ref db) = self.db {
+            let db = db.lock().unwrap();
+            if let Err(e) = db.add(rel_path, size, mtime) {
+                warn!("Failed to update cache DB for {}: {}", rel_path, e);
+            }
+        }
+    }
+
+    /// Remove a file from the cache DB.
+    fn db_remove(&self, rel_path: &str) {
+        if let Some(ref db) = self.db {
+            let db = db.lock().unwrap();
+            if let Err(e) = db.remove(rel_path) {
+                warn!("Failed to remove {} from cache DB: {}", rel_path, e);
+            }
+        }
+    }
+
+    /// Rename a file in the cache DB (remove old, add new).
+    fn db_rename(&self, old_path: &str, new_path: &str) {
+        if let Some(ref db) = self.db {
+            let db = db.lock().unwrap();
+            let info = db.get(old_path).ok().flatten();
+            let _ = db.remove(old_path);
+            if let Some(entry) = info {
+                let _ = db.add(new_path, entry.size, entry.mtime);
+            }
         }
     }
 
@@ -129,6 +313,14 @@ impl PhotoCacheFS {
             + Duration::from_secs(meta.ctime() as u64);
         let crtime = meta.created().unwrap_or(UNIX_EPOCH);
 
+        // Ensure owner has rw access (NAS files may be owned by a different uid)
+        let mut perm = meta.mode() as u16;
+        if kind == FileType::Directory {
+            perm |= 0o700; // rwx for owner on dirs
+        } else {
+            perm |= 0o600; // rw for owner on files
+        }
+
         FileAttr {
             ino,
             size: meta.len(),
@@ -138,10 +330,10 @@ impl PhotoCacheFS {
             ctime,
             crtime,
             kind,
-            perm: meta.mode() as u16,
+            perm,
             nlink: meta.nlink() as u32,
-            uid: meta.uid(),
-            gid: meta.gid(),
+            uid: self.uid,
+            gid: self.gid,
             rdev: meta.rdev() as u32,
             blksize: meta.blksize() as u32,
             flags: 0,
@@ -149,6 +341,11 @@ impl PhotoCacheFS {
     }
 
     /// List children of a directory by merging NAS + cache entries.
+    /// Names to hide from directory listings (Synology metadata, macOS resource forks).
+    fn is_hidden_entry(name: &str) -> bool {
+        name == "@eaDir" || name.starts_with("._") || name.contains("@Syno")
+    }
+
     fn list_dir(&self, rel_path: &str) -> Vec<(String, FileType)> {
         let mut entries: HashMap<String, FileType> = HashMap::new();
 
@@ -161,6 +358,9 @@ impl PhotoCacheFS {
         if let Ok(read_dir) = fs::read_dir(&nas_dir) {
             for entry in read_dir.filter_map(|e| e.ok()) {
                 if let Some(name) = entry.file_name().to_str() {
+                    if Self::is_hidden_entry(name) {
+                        continue;
+                    }
                     let ft = if entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
                         FileType::Directory
                     } else {
@@ -180,6 +380,9 @@ impl PhotoCacheFS {
         if let Ok(read_dir) = fs::read_dir(&cache_dir) {
             for entry in read_dir.filter_map(|e| e.ok()) {
                 if let Some(name) = entry.file_name().to_str() {
+                    if Self::is_hidden_entry(name) {
+                        continue;
+                    }
                     let ft = if entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
                         FileType::Directory
                     } else {
@@ -190,7 +393,9 @@ impl PhotoCacheFS {
             }
         }
 
-        entries.into_iter().collect()
+        let mut result: Vec<(String, FileType)> = entries.into_iter().collect();
+        result.sort_by(|a, b| a.0.cmp(&b.0));
+        result
     }
 
     fn alloc_fh(&self) -> u64 {
@@ -290,8 +495,8 @@ impl Filesystem for PhotoCacheFS {
                         kind: FileType::Directory,
                         perm: 0o755,
                         nlink: 2,
-                        uid: unsafe { libc::getuid() },
-                        gid: unsafe { libc::getgid() },
+                        uid: self.uid,
+                        gid: self.gid,
                         rdev: 0,
                         blksize: 512,
                         flags: 0,
@@ -360,12 +565,15 @@ impl Filesystem for PhotoCacheFS {
         };
         entries.push((parent_ino, FileType::Directory, "..".to_string()));
 
-        // Merged directory listing
+        // Merged directory listing — lock inodes once for all children
         let children = self.list_dir(&rel_path);
-        for (name, ft) in children {
-            let child_rel = Self::join_rel(&rel_path, &name);
-            let child_ino = self.inodes.lock().unwrap().get_or_create(&child_rel);
-            entries.push((child_ino, ft, name));
+        {
+            let mut inodes = self.inodes.lock().unwrap();
+            for (name, ft) in children {
+                let child_rel = Self::join_rel(&rel_path, &name);
+                let child_ino = inodes.get_or_create(&child_rel);
+                entries.push((child_ino, ft, name));
+            }
         }
 
         for (i, (ino, ft, name)) in entries.iter().enumerate().skip(offset as usize) {
@@ -389,6 +597,9 @@ impl Filesystem for PhotoCacheFS {
             }
         };
 
+        // Trigger background caching of this file's directory
+        self.trigger_dir_cache(&rel_path);
+
         let resolved = match self.resolve(&rel_path) {
             Some(p) => p,
             None => {
@@ -410,11 +621,12 @@ impl Filesystem for PhotoCacheFS {
             }
         };
 
+        let is_cached = resolved.starts_with(&self.cache_dir);
         let fh = self.alloc_fh();
         self.file_handles
             .lock()
             .unwrap()
-            .insert(fh, OpenFileHandle { file });
+            .insert(fh, OpenFileHandle { file, is_cached });
 
         reply.opened(FileHandle(fh), FopenFlags::empty());
     }
@@ -457,7 +669,7 @@ impl Filesystem for PhotoCacheFS {
     fn release(
         &self,
         _req: &Request,
-        _ino: INodeNo,
+        ino: INodeNo,
         fh: FileHandle,
         _flags: OpenFlags,
         _lock_owner: Option<LockOwner>,
@@ -465,6 +677,26 @@ impl Filesystem for PhotoCacheFS {
         reply: ReplyEmpty,
     ) {
         self.file_handles.lock().unwrap().remove(&fh.0);
+
+        // Update cache DB with final file state
+        let rel_path = {
+            let inodes = self.inodes.lock().unwrap();
+            inodes.get_path(ino.0).map(|p| p.to_string())
+        };
+        if let Some(rel) = rel_path {
+            let cache_path = self.cache_dir.join(&rel);
+            if cache_path.exists() {
+                if let Ok(meta) = fs::metadata(&cache_path) {
+                    let mtime = meta.modified()
+                        .unwrap_or(UNIX_EPOCH)
+                        .duration_since(UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_secs_f64();
+                    self.db_add(&rel, meta.len(), mtime);
+                }
+            }
+        }
+
         reply.ok();
     }
 
@@ -498,31 +730,18 @@ impl Filesystem for PhotoCacheFS {
         };
 
         let child_rel = Self::join_rel(&parent_rel, name_str);
-        let nas_path = self.nas_path.join(&child_rel);
+        info!("CREATE: {} (cache, pending NAS sync)", child_rel);
         let cache_path = self.cache_dir.join(&child_rel);
 
-        // Create parent directories on both sides
-        if let Some(p) = nas_path.parent() {
-            fs::create_dir_all(p).ok();
-        }
+        // Create in cache only — NAS sync happens in background
         if let Some(p) = cache_path.parent() {
             fs::create_dir_all(p).ok();
         }
 
-        // Write-through: create on NAS first
-        let nas_file = match File::create(&nas_path) {
-            Ok(f) => f,
-            Err(e) => {
-                error!("Failed to create on NAS {:?}: {}", nas_path, e);
-                reply.error(Errno::EIO);
-                return;
-            }
-        };
-        drop(nas_file);
-
-        // Also create in cache
         if let Err(e) = File::create(&cache_path) {
-            warn!("Failed to create cache copy {:?}: {}", cache_path, e);
+            error!("Failed to create cache file {:?}: {}", cache_path, e);
+            reply.error(Errno::EIO);
+            return;
         }
 
         // Set permissions
@@ -530,8 +749,14 @@ impl Filesystem for PhotoCacheFS {
         {
             use std::os::unix::fs::PermissionsExt;
             let perms = std::fs::Permissions::from_mode(mode);
-            fs::set_permissions(&nas_path, perms.clone()).ok();
             fs::set_permissions(&cache_path, perms).ok();
+        }
+
+        // Mark as pending NAS write
+        self.pending_writes.lock().unwrap().insert(child_rel.clone());
+        if let Some(ref db) = self.db {
+            let db = db.lock().unwrap();
+            db.add_pending_write(&child_rel).ok();
         }
 
         // Open the cache copy for subsequent read/write
@@ -541,19 +766,14 @@ impl Filesystem for PhotoCacheFS {
             .open(&cache_path)
         {
             Ok(f) => f,
-            Err(_) => match OpenOptions::new().read(true).write(true).open(&nas_path) {
-                Ok(f) => f,
-                Err(e) => {
-                    error!("Failed to open created file: {}", e);
-                    reply.error(Errno::EIO);
-                    return;
-                }
-            },
+            Err(e) => {
+                error!("Failed to open created file: {}", e);
+                reply.error(Errno::EIO);
+                return;
+            }
         };
 
-        let meta = match fs::metadata(&cache_path)
-            .or_else(|_| fs::metadata(&nas_path))
-        {
+        let meta = match fs::metadata(&cache_path) {
             Ok(m) => m,
             Err(_) => {
                 reply.error(Errno::EIO);
@@ -567,7 +787,7 @@ impl Filesystem for PhotoCacheFS {
         self.file_handles
             .lock()
             .unwrap()
-            .insert(fh, OpenFileHandle { file });
+            .insert(fh, OpenFileHandle { file, is_cached: true });
 
         reply.created(&TTL, &attr, Generation(0), FileHandle(fh), FopenFlags::empty());
     }
@@ -584,29 +804,7 @@ impl Filesystem for PhotoCacheFS {
         _lock_owner: Option<LockOwner>,
         reply: ReplyWrite,
     ) {
-        // Write-through: write to NAS, then update cache copy
-        let rel_path = {
-            let inodes = self.inodes.lock().unwrap();
-            match inodes.get_path(ino.0) {
-                Some(p) => p.to_string(),
-                None => {
-                    reply.error(Errno::ENOENT);
-                    return;
-                }
-            }
-        };
-
-        // Write to NAS
-        let nas_path = self.nas_path.join(&rel_path);
-        if nas_path.exists() {
-            if let Ok(mut f) = OpenOptions::new().write(true).open(&nas_path) {
-                if f.seek(SeekFrom::Start(offset)).is_ok() {
-                    let _ = f.write_all(data);
-                }
-            }
-        }
-
-        // Write to cache via file handle
+        // Write to cache only — NAS sync happens in background
         let mut handles = self.file_handles.lock().unwrap();
         let handle = match handles.get_mut(&fh.0) {
             Some(h) => h,
@@ -622,7 +820,9 @@ impl Filesystem for PhotoCacheFS {
             return;
         }
         match handle.file.write(data) {
-            Ok(n) => reply.written(n as u32),
+            Ok(n) => {
+                reply.written(n as u32);
+            }
             Err(e) => {
                 error!("write error: {}", e);
                 reply.error(Errno::EIO);
@@ -715,23 +915,28 @@ impl Filesystem for PhotoCacheFS {
         };
 
         let child_rel = Self::join_rel(&parent_rel, name_str);
+        info!("DELETE: {}", child_rel);
 
         // Delete from NAS
         let nas_path = self.nas_path.join(&child_rel);
         if nas_path.exists() {
             if let Err(e) = fs::remove_file(&nas_path) {
-                error!("unlink NAS failed {:?}: {}", nas_path, e);
+                error!("DELETE NAS failed {:?}: {}", nas_path, e);
                 reply.error(Errno::EIO);
                 return;
             }
+            info!("  NAS: removed");
         }
 
         // Delete from cache
         let cache_path = self.cache_dir.join(&child_rel);
         if cache_path.exists() {
             fs::remove_file(&cache_path).ok();
+            info!("  Cache: removed");
         }
 
+        self.db_remove(&child_rel);
+        info!("  DB: removed");
         self.inodes.lock().unwrap().remove_path(&child_rel);
         reply.ok();
     }
@@ -757,6 +962,7 @@ impl Filesystem for PhotoCacheFS {
         };
 
         let child_rel = Self::join_rel(&parent_rel, name_str);
+        info!("RMDIR: {}", child_rel);
 
         // Check that merged directory is empty
         let children = self.list_dir(&child_rel);
@@ -769,16 +975,18 @@ impl Filesystem for PhotoCacheFS {
         let nas_dir = self.nas_path.join(&child_rel);
         if nas_dir.exists() {
             if let Err(e) = fs::remove_dir(&nas_dir) {
-                error!("rmdir NAS failed {:?}: {}", nas_dir, e);
+                error!("RMDIR NAS failed {:?}: {}", nas_dir, e);
                 reply.error(Errno::EIO);
                 return;
             }
+            info!("  NAS: removed");
         }
 
         // Remove from cache
         let cache_dir = self.cache_dir.join(&child_rel);
         if cache_dir.exists() {
             fs::remove_dir(&cache_dir).ok();
+            info!("  Cache: removed");
         }
 
         self.inodes.lock().unwrap().remove_path(&child_rel);
@@ -831,6 +1039,7 @@ impl Filesystem for PhotoCacheFS {
 
         let old_rel = Self::join_rel(&parent_rel, name_str);
         let new_rel = Self::join_rel(&newparent_rel, newname_str);
+        info!("RENAME: {} -> {}", old_rel, new_rel);
 
         // Rename on NAS
         let old_nas = self.nas_path.join(&old_rel);
@@ -840,10 +1049,11 @@ impl Filesystem for PhotoCacheFS {
                 fs::create_dir_all(p).ok();
             }
             if let Err(e) = fs::rename(&old_nas, &new_nas) {
-                error!("rename NAS failed: {}", e);
+                error!("RENAME NAS failed: {}", e);
                 reply.error(Errno::EIO);
                 return;
             }
+            info!("  NAS: renamed");
         }
 
         // Rename in cache
@@ -854,8 +1064,11 @@ impl Filesystem for PhotoCacheFS {
                 fs::create_dir_all(p).ok();
             }
             fs::rename(&old_cache, &new_cache).ok();
+            info!("  Cache: renamed");
         }
 
+        self.db_rename(&old_rel, &new_rel);
+        info!("  DB: updated");
         self.inodes.lock().unwrap().rename(&old_rel, &new_rel);
         reply.ok();
     }
@@ -929,33 +1142,182 @@ impl Filesystem for PhotoCacheFS {
         }
     }
 
+    fn getxattr(&self, _req: &Request, ino: INodeNo, name: &OsStr, size: u32, reply: ReplyXattr) {
+        let rel_path = {
+            let inodes = self.inodes.lock().unwrap();
+            match inodes.get_path(ino.0) {
+                Some(p) => p.to_string(),
+                None => {
+                    reply.error(Errno::from_i32(libc::ENOATTR));
+                    return;
+                }
+            }
+        };
+
+        let name_str = name.to_str().unwrap_or("");
+
+        // Determine color: Orange = pending write, Green = cached (dir or file)
+        let color = if self.is_pending_write(&rel_path) {
+            Some(FINDER_COLOR_ORANGE)
+        } else if self.is_cached(&rel_path) || self.is_file_cached(&rel_path) {
+            Some(FINDER_COLOR_GREEN)
+        } else {
+            None
+        };
+
+        if let Some(color_byte) = color {
+            if name_str == FINDER_INFO_XATTR {
+                let info = make_finder_info(color_byte);
+                if size == 0 {
+                    reply.size(FINDER_INFO_LEN as u32);
+                } else if size >= FINDER_INFO_LEN as u32 {
+                    reply.data(&info);
+                } else {
+                    reply.error(Errno::ERANGE);
+                }
+                return;
+            }
+
+            if name_str == FINDER_TAGS_XATTR {
+                let plist = if color_byte == FINDER_COLOR_ORANGE {
+                    ORANGE_TAG_PLIST
+                } else {
+                    GREEN_TAG_PLIST
+                };
+                if size == 0 {
+                    reply.size(plist.len() as u32);
+                } else if size >= plist.len() as u32 {
+                    reply.data(plist);
+                } else {
+                    reply.error(Errno::ERANGE);
+                }
+                return;
+            }
+        }
+
+        reply.error(Errno::from_i32(libc::ENOATTR));
+    }
+
+    fn listxattr(&self, _req: &Request, ino: INodeNo, size: u32, reply: ReplyXattr) {
+        let rel_path = {
+            let inodes = self.inodes.lock().unwrap();
+            match inodes.get_path(ino.0) {
+                Some(p) => p.to_string(),
+                None => {
+                    reply.error(Errno::ENOENT);
+                    return;
+                }
+            }
+        };
+
+        if self.is_pending_write(&rel_path) || self.is_cached(&rel_path) || self.is_file_cached(&rel_path) {
+            // Report both xattr names (null-terminated each)
+            let mut names = Vec::from(FINDER_INFO_XATTR.as_bytes());
+            names.push(0);
+            names.extend_from_slice(FINDER_TAGS_XATTR.as_bytes());
+            names.push(0);
+            if size == 0 {
+                reply.size(names.len() as u32);
+            } else if size >= names.len() as u32 {
+                reply.data(&names);
+            } else {
+                reply.error(Errno::ERANGE);
+            }
+        } else if size == 0 {
+            reply.size(0);
+        } else {
+            reply.data(&[]);
+        }
+    }
+
+    fn setxattr(&self, _req: &Request, _ino: INodeNo, _name: &OsStr, _value: &[u8], _flags: i32, _position: u32, reply: ReplyEmpty) {
+        // Silently accept — prevents Finder "wants to change tag" prompts
+        reply.ok();
+    }
+
+    fn removexattr(&self, _req: &Request, _ino: INodeNo, _name: &OsStr, reply: ReplyEmpty) {
+        reply.ok();
+    }
+
     fn statfs(&self, _req: &Request, _ino: INodeNo, reply: ReplyStatfs) {
-        // Report stats based on the NAS path filesystem
-        // Use a reasonable default
+        let stv = unsafe {
+            let mut buf: libc::statfs = std::mem::zeroed();
+            let c_path = std::ffi::CString::new(
+                self.nas_path.as_os_str().as_encoded_bytes()
+            ).unwrap_or_default();
+            if libc::statfs(c_path.as_ptr(), &mut buf) == 0 {
+                buf
+            } else {
+                // Fallback if NAS unavailable
+                reply.statfs(0, 0, 0, 0, 0, 4096, 255, 4096);
+                return;
+            }
+        };
         reply.statfs(
-            0,          // blocks
-            0,          // bfree
-            0,          // bavail
-            0,          // files
-            0,          // ffree
-            512,        // bsize
-            255,        // namelen
-            0,          // frsize
+            stv.f_blocks as u64,
+            stv.f_bfree as u64,
+            stv.f_bavail as u64,
+            stv.f_files as u64,
+            stv.f_ffree as u64,
+            stv.f_bsize as u32,
+            255,
+            stv.f_bsize as u32,
         );
     }
+
 }
 
 /// Mount the PhotoCacheFS at the given mount point.
-pub fn mount(nas_path: PathBuf, cache_dir: PathBuf, mount_point: &Path) {
+/// If the mount point is already a FUSE mount, unmount it first.
+pub fn mount(
+    nas_path: PathBuf,
+    cache_dir: PathBuf,
+    mount_point: &Path,
+    db_path: &Path,
+    max_cache_bytes: u64,
+) {
+    // Try to unmount if already mounted (force to handle busy mounts)
+    let _ = std::process::Command::new("umount")
+        .arg("-f")
+        .arg(mount_point)
+        .output();
+
     fs::create_dir_all(mount_point).ok();
     fs::create_dir_all(&cache_dir).ok();
-    let filesystem = PhotoCacheFS::new(nas_path, cache_dir);
+
+    let db = CacheDB::open(db_path).ok();
+
+    // Spawn background cache worker with its own DB connection
+    let worker = {
+        let worker_db = CacheDB::open(db_path).expect("Failed to open worker DB");
+        CacheWorker::spawn(
+            nas_path.clone(),
+            cache_dir.clone(),
+            Arc::new(Mutex::new(worker_db)),
+            max_cache_bytes,
+        )
+    };
+
+    // Spawn background write flusher (syncs local writes to NAS every 5 seconds)
+    let flush_worker = {
+        let flush_db = CacheDB::open(db_path).expect("Failed to open flush DB");
+        WriteFlushWorker::spawn(
+            nas_path.clone(),
+            cache_dir.clone(),
+            Arc::new(Mutex::new(flush_db)),
+            std::time::Duration::from_secs(5),
+        )
+    };
+
+    let filesystem = PhotoCacheFS::new(nas_path, cache_dir, db, Some(worker), Some(flush_worker));
     let mut config = Config::default();
     config.mount_options = vec![
         MountOption::FSName("photocache".to_string()),
-        MountOption::AutoUnmount,
     ];
-    fuser::mount2(filesystem, mount_point, &config).unwrap();
+    if let Err(e) = fuser::mount2(filesystem, mount_point, &config) {
+        eprintln!("Failed to mount at {}: {}", mount_point.display(), e);
+        std::process::exit(1);
+    }
 }
 
 #[cfg(test)]
@@ -1013,7 +1375,7 @@ mod tests {
         fs::write(nas.join("photo.jpg"), b"nas-version").unwrap();
         fs::write(cache.join("photo.jpg"), b"cache-version").unwrap();
 
-        let fs = PhotoCacheFS::new(nas.clone(), cache.clone());
+        let fs = PhotoCacheFS::new(nas.clone(), cache.clone(), None, None, None);
         let resolved = fs.resolve("photo.jpg").unwrap();
         assert_eq!(resolved, cache.join("photo.jpg"));
     }
@@ -1029,7 +1391,7 @@ mod tests {
         // File only on NAS
         fs::write(nas.join("photo.jpg"), b"nas-only").unwrap();
 
-        let fs = PhotoCacheFS::new(nas.clone(), cache.clone());
+        let fs = PhotoCacheFS::new(nas.clone(), cache.clone(), None, None, None);
         let resolved = fs.resolve("photo.jpg").unwrap();
         assert_eq!(resolved, nas.join("photo.jpg"));
     }
@@ -1042,7 +1404,7 @@ mod tests {
         fs::create_dir_all(&nas).unwrap();
         fs::create_dir_all(&cache).unwrap();
 
-        let fs = PhotoCacheFS::new(nas, cache);
+        let fs = PhotoCacheFS::new(nas, cache, None, None, None);
         assert!(fs.resolve("nonexistent.jpg").is_none());
     }
 
@@ -1058,7 +1420,7 @@ mod tests {
         fs::write(nas.join("a.jpg"), b"aaa").unwrap();
         fs::write(cache.join("b.jpg"), b"bbb").unwrap();
 
-        let fs = PhotoCacheFS::new(nas, cache);
+        let fs = PhotoCacheFS::new(nas, cache, None, None, None);
         let entries = fs.list_dir("");
         let names: HashSet<String> = entries.into_iter().map(|(n, _)| n).collect();
         assert!(names.contains("a.jpg"));
@@ -1077,7 +1439,7 @@ mod tests {
         fs::write(nas.join("photo.jpg"), b"nas").unwrap();
         fs::write(cache.join("photo.jpg"), b"cache").unwrap();
 
-        let fs = PhotoCacheFS::new(nas, cache);
+        let fs = PhotoCacheFS::new(nas, cache, None, None, None);
         let entries = fs.list_dir("");
         let names: Vec<String> = entries.into_iter().map(|(n, _)| n).collect();
         assert_eq!(names.iter().filter(|n| *n == "photo.jpg").count(), 1);
@@ -1090,5 +1452,197 @@ mod tests {
             PhotoCacheFS::join_rel("March 2026", "IMG_001.jpg"),
             "March 2026/IMG_001.jpg"
         );
+    }
+
+    // --- is_hidden_entry tests ---
+
+    #[test]
+    fn test_is_hidden_entry_synology() {
+        assert!(PhotoCacheFS::is_hidden_entry("@eaDir"));
+    }
+
+    #[test]
+    fn test_is_hidden_entry_resource_fork() {
+        assert!(PhotoCacheFS::is_hidden_entry("._IMG_001.jpg"));
+        assert!(PhotoCacheFS::is_hidden_entry("._photo.heic"));
+    }
+
+    #[test]
+    fn test_is_hidden_entry_syno_files() {
+        assert!(PhotoCacheFS::is_hidden_entry("@SynoResource"));
+        assert!(PhotoCacheFS::is_hidden_entry("file@SynoExt"));
+    }
+
+    #[test]
+    fn test_is_hidden_entry_normal_files() {
+        assert!(!PhotoCacheFS::is_hidden_entry("IMG_001.jpg"));
+        assert!(!PhotoCacheFS::is_hidden_entry("March 2026"));
+        assert!(!PhotoCacheFS::is_hidden_entry(".hidden_dir"));
+    }
+
+    // --- is_file_cached tests ---
+
+    #[test]
+    fn test_is_file_cached_with_cached_file() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let nas = tmp.path().join("nas");
+        let cache = tmp.path().join("cache");
+        fs::create_dir_all(&nas).unwrap();
+        fs::create_dir_all(cache.join("March 2026")).unwrap();
+        fs::write(cache.join("March 2026/IMG_001.jpg"), b"data").unwrap();
+
+        let fsys = PhotoCacheFS::new(nas, cache, None, None, None);
+        assert!(fsys.is_file_cached("March 2026/IMG_001.jpg"));
+    }
+
+    #[test]
+    fn test_is_file_cached_without_cached_file() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let nas = tmp.path().join("nas");
+        let cache = tmp.path().join("cache");
+        fs::create_dir_all(&nas).unwrap();
+        fs::create_dir_all(&cache).unwrap();
+
+        let fsys = PhotoCacheFS::new(nas, cache, None, None, None);
+        assert!(!fsys.is_file_cached("March 2026/IMG_001.jpg"));
+    }
+
+    #[test]
+    fn test_is_file_cached_rejects_root_and_bare_names() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let nas = tmp.path().join("nas");
+        let cache = tmp.path().join("cache");
+        fs::create_dir_all(&nas).unwrap();
+        fs::create_dir_all(&cache).unwrap();
+
+        let fsys = PhotoCacheFS::new(nas, cache, None, None, None);
+        assert!(!fsys.is_file_cached(""), "empty path should not be cached");
+        assert!(!fsys.is_file_cached("toplevel.jpg"), "bare filename without dir should not be cached");
+    }
+
+    // --- is_cached tests ---
+
+    #[test]
+    fn test_is_cached_with_cached_dir() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let nas = tmp.path().join("nas");
+        let cache = tmp.path().join("cache");
+        fs::create_dir_all(&nas).unwrap();
+        fs::create_dir_all(&cache).unwrap();
+
+        let db = crate::cache_db::CacheDB::open(Path::new(":memory:")).unwrap();
+        db.touch_dir("March 2026", 5000).unwrap();
+
+        let fsys = PhotoCacheFS::new(nas, cache, Some(db), None, None);
+        assert!(fsys.is_cached("March 2026"));
+    }
+
+    #[test]
+    fn test_is_cached_file_in_cached_dir() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let nas = tmp.path().join("nas");
+        let cache = tmp.path().join("cache");
+        fs::create_dir_all(&nas).unwrap();
+        fs::create_dir_all(&cache).unwrap();
+
+        let db = crate::cache_db::CacheDB::open(Path::new(":memory:")).unwrap();
+        db.touch_dir("March 2026", 5000).unwrap();
+
+        let fsys = PhotoCacheFS::new(nas, cache, Some(db), None, None);
+        assert!(fsys.is_cached("March 2026/IMG_001.jpg"));
+    }
+
+    #[test]
+    fn test_is_cached_uncached_path() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let nas = tmp.path().join("nas");
+        let cache = tmp.path().join("cache");
+        fs::create_dir_all(&nas).unwrap();
+        fs::create_dir_all(&cache).unwrap();
+
+        let fsys = PhotoCacheFS::new(nas, cache, None, None, None);
+        assert!(!fsys.is_cached("Uncached Dir"));
+        assert!(!fsys.is_cached("Uncached Dir/photo.jpg"));
+        assert!(!fsys.is_cached(""), "root should not be cached");
+    }
+
+    // --- parent_dir tests ---
+
+    #[test]
+    fn test_parent_dir_with_file_in_dir() {
+        assert_eq!(PhotoCacheFS::parent_dir("March 2026/IMG_001.jpg"), Some("March 2026"));
+    }
+
+    #[test]
+    fn test_parent_dir_bare_name() {
+        assert_eq!(PhotoCacheFS::parent_dir("toplevel"), None);
+    }
+
+    #[test]
+    fn test_parent_dir_empty() {
+        assert_eq!(PhotoCacheFS::parent_dir(""), None);
+    }
+
+    #[test]
+    fn test_parent_dir_nested() {
+        // Returns only the first component
+        assert_eq!(PhotoCacheFS::parent_dir("a/b/c"), Some("a"));
+    }
+
+    // --- make_finder_info tests ---
+
+    #[test]
+    fn test_make_finder_info_green() {
+        let info = make_finder_info(FINDER_COLOR_GREEN);
+        assert_eq!(info.len(), FINDER_INFO_LEN);
+        assert_eq!(info[9], FINDER_COLOR_GREEN);
+        // All other bytes should be zero
+        for (i, &b) in info.iter().enumerate() {
+            if i != 9 {
+                assert_eq!(b, 0, "byte {} should be 0", i);
+            }
+        }
+    }
+
+    #[test]
+    fn test_make_finder_info_yellow() {
+        let info = make_finder_info(FINDER_COLOR_YELLOW);
+        assert_eq!(info[9], FINDER_COLOR_YELLOW);
+        assert_eq!(info[9], 0x06);
+    }
+
+    #[test]
+    fn test_make_finder_info_orange() {
+        let info = make_finder_info(FINDER_COLOR_ORANGE);
+        assert_eq!(info[9], FINDER_COLOR_ORANGE);
+        assert_eq!(info[9], 0x02);
+    }
+
+    #[test]
+    fn test_make_finder_info_is_correct_size() {
+        let info = make_finder_info(0);
+        assert_eq!(info.len(), 32);
+    }
+
+    // --- list_dir filters hidden entries ---
+
+    #[test]
+    fn test_list_dir_hides_synology_metadata() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let nas = tmp.path().join("nas");
+        let cache = tmp.path().join("cache");
+        fs::create_dir_all(&nas).unwrap();
+        fs::create_dir_all(&cache).unwrap();
+
+        fs::write(nas.join("photo.jpg"), b"data").unwrap();
+        fs::create_dir_all(nas.join("@eaDir")).unwrap();
+        fs::write(nas.join("._photo.jpg"), b"resource fork").unwrap();
+
+        let fsys = PhotoCacheFS::new(nas, cache, None, None, None);
+        let entries = fsys.list_dir("");
+        let names: Vec<String> = entries.into_iter().map(|(n, _)| n).collect();
+        assert!(names.contains(&"photo.jpg".to_string()));
+        assert!(!names.contains(&"@eaDir".to_string()));
+        assert!(!names.contains(&"._photo.jpg".to_string()));
     }
 }
