@@ -3,9 +3,13 @@ name = "photocache"
 version = "0.1.0"
 edition = "2024"
 
+[features]
+default = []
+fuse = ["dep:fuser", "dep:libc"]
+
 [dependencies]
-fuser = "0.17"
-libc = "0.2"
+fuser = { version = "0.17", optional = true }
+libc = { version = "0.2", optional = true }
 rusqlite = { version = "0.34", features = ["bundled"] }
 clap = { version = "4", features = ["derive"] }
 serde = { version = "1", features = ["derive"] }
