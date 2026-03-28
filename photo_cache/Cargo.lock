@@ -542,6 +542,7 @@ dependencies = [
  "env_logger",
  "filetime",
  "fuser",
+ "libc",
  "log",
  "rusqlite",
  "serde",
