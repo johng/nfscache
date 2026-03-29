@@ -26,9 +26,8 @@ brew install macfuse
 
 ```bash
 cargo build --release
+sudo cp target/release/photocache /usr/local/bin/
 ```
-
-The binary is at `target/release/photocache`.
 
 ## Setup
 
@@ -37,10 +36,10 @@ The binary is at `target/release/photocache`.
 sudo mount -v -t nfs -o vers=3,nolock,resvport 192.168.50.21:/volume1/media /Users/johng/nas_media
 
 # 2. Initialize config and cache directories
-./target/release/photocache init
+photocache init
 
 # 3. Mount the virtual filesystem
-./target/release/photocache mount
+photocache mount
 ```
 
 Directories are cached automatically as you browse and open photos.

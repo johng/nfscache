@@ -6,7 +6,7 @@
     <string>com.johng.photocache-mount</string>
     <key>ProgramArguments</key>
     <array>
-        <string>/Users/johng/repos/scripts/target/release/photocache</string>
+        <string>/usr/local/bin/photocache</string>
         <string>mount</string>
     </array>
     <key>RunAtLoad</key>
