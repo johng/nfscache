@@ -104,6 +104,8 @@ struct OpenFileHandle {
     file: File,
     /// True if the file handle points to the cache copy (vs NAS directly)
     is_cached: bool,
+    /// True if data was written through this handle
+    dirty: bool,
 }
 
 pub struct PhotoCacheFS {
@@ -672,7 +674,7 @@ impl Filesystem for PhotoCacheFS {
         self.file_handles
             .lock()
             .unwrap()
-            .insert(fh, OpenFileHandle { file, is_cached });
+            .insert(fh, OpenFileHandle { file, is_cached, dirty: false });
 
         reply.opened(FileHandle(fh), FopenFlags::empty());
     }
@@ -722,7 +724,8 @@ impl Filesystem for PhotoCacheFS {
         _flush: bool,
         reply: ReplyEmpty,
     ) {
-        self.file_handles.lock().unwrap().remove(&fh.0);
+        let handle = self.file_handles.lock().unwrap().remove(&fh.0);
+        let was_dirty = handle.map(|h| h.dirty && h.is_cached).unwrap_or(false);
 
         // Update cache DB with final file state
         let rel_path = {
@@ -739,6 +742,22 @@ impl Filesystem for PhotoCacheFS {
                         .unwrap_or_default()
                         .as_secs_f64();
                     self.db_add(&rel, meta.len(), mtime);
+                }
+
+                // If file was modified, queue for NAS sync (skip temp files)
+                if was_dirty {
+                    let file_name = std::path::Path::new(&rel)
+                        .file_name()
+                        .and_then(|n| n.to_str())
+                        .unwrap_or("");
+                    if !Self::is_temp_file(file_name) {
+                        info!("File modified, queuing for NAS sync: {}", rel);
+                        self.pending_writes.lock().unwrap().insert(rel.clone());
+                        if let Some(ref db) = self.db {
+                            let db = db.lock().unwrap();
+                            db.add_pending_write(&rel).ok();
+                        }
+                    }
                 }
             }
         }
@@ -839,7 +858,7 @@ impl Filesystem for PhotoCacheFS {
         self.file_handles
             .lock()
             .unwrap()
-            .insert(fh, OpenFileHandle { file, is_cached: true });
+            .insert(fh, OpenFileHandle { file, is_cached: true, dirty: false });
 
         reply.created(&TTL, &attr, Generation(0), FileHandle(fh), FopenFlags::empty());
     }
@@ -873,6 +892,7 @@ impl Filesystem for PhotoCacheFS {
         }
         match handle.file.write(data) {
             Ok(n) => {
+                handle.dirty = true;
                 reply.written(n as u32);
             }
             Err(e) => {
