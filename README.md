@@ -25,9 +25,10 @@ brew install macfuse
 ## Install
 
 ```bash
-cargo build --release
-sudo cp target/release/photocache /usr/local/bin/
+make install
 ```
+
+This builds the release binary, copies it to `/usr/local/bin/`, and initializes the config.
 
 ## Setup
 
@@ -35,14 +36,24 @@ sudo cp target/release/photocache /usr/local/bin/
 # 1. Mount your NAS (if not already)
 sudo mount -v -t nfs -o vers=3,nolock,resvport 192.168.50.21:/volume1/media /Users/johng/nas_media
 
-# 2. Initialize config and cache directories
-photocache init
-
-# 3. Mount the virtual filesystem
+# 2. Mount the virtual filesystem
 photocache mount
 ```
 
 Directories are cached automatically as you browse and open photos.
+
+## Make targets
+
+| Target | Description |
+|--------|-------------|
+| `make build` | Build release binary |
+| `make install` | Build, install to `/usr/local/bin`, init config |
+| `make uninstall` | Stop service, remove binary and plist |
+| `make service-start` | Install and start launchd service |
+| `make service-stop` | Stop and remove launchd service |
+| `make service-restart` | Restart launchd service |
+| `make test` | Run tests |
+| `make clean` | Remove build artifacts |
 
 ## Commands
 
@@ -72,35 +83,32 @@ Config lives at `~/.photo_cache/config.json`:
 
 ## Run as a background service
 
-Install the launchd service to auto-mount at login:
-
 ```bash
-cp launchd/com.johng.photocache-mount.plist ~/Library/LaunchAgents/
-launchctl load ~/Library/LaunchAgents/com.johng.photocache-mount.plist
+make service-start
 ```
 
 To stop:
 
 ```bash
-launchctl unload ~/Library/LaunchAgents/com.johng.photocache-mount.plist
+make service-stop
 ```
 
 ## Logging
 
 ```bash
 # Cache operations only (recommended)
-RUST_LOG=photocache::sync=info ./target/release/photocache mount
+RUST_LOG=photocache::sync=info photocache mount
 
 # Per-file detail
-RUST_LOG=photocache::sync=debug ./target/release/photocache mount
+RUST_LOG=photocache::sync=debug photocache mount
 
 # All modules
-RUST_LOG=photocache=debug ./target/release/photocache mount
+RUST_LOG=photocache=debug photocache mount
 ```
 
 When running as a launchd service, logs go to:
-- `~/.photo_cache/mount.log`
-- `~/.photo_cache/mount.err.log`
+- `~/Library/Logs/photocache/mount.log`
+- `~/Library/Logs/photocache/mount.err.log`
 
 ## Architecture
 

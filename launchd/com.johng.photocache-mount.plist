@@ -13,9 +13,14 @@
     <true/>
     <key>KeepAlive</key>
     <true/>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>RUST_LOG</key>
+        <string>photocache::sync=info</string>
+    </dict>
     <key>StandardOutPath</key>
-    <string>/Users/johng/.photo_cache/mount.log</string>
+    <string>/Users/johng/Library/Logs/photocache/mount.log</string>
     <key>StandardErrorPath</key>
-    <string>/Users/johng/.photo_cache/mount.err.log</string>
+    <string>/Users/johng/Library/Logs/photocache/mount.err.log</string>
 </dict>
 </plist>
