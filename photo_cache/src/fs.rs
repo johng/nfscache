@@ -208,10 +208,13 @@ impl PhotoCacheFS {
 
     /// Trigger background caching of the directory containing this file.
     fn trigger_dir_cache(&self, rel_path: &str) {
-        // Drain completed cache operations, empty dirs, and flushed writes
+        // Drain completed, evicted, empty dirs, and flushed writes
         if let Some(ref worker) = self.cache_worker {
             for dir in worker.drain_completed() {
                 self.cached_dirs.lock().unwrap().insert(dir);
+            }
+            for dir in worker.drain_evicted() {
+                self.cached_dirs.lock().unwrap().remove(&dir);
             }
             for dir in worker.drain_empty() {
                 self.empty_dirs.lock().unwrap().insert(dir);

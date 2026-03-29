@@ -133,13 +133,15 @@ pub fn cache_directory(
 }
 
 /// Evict least-recently-accessed directories until total cache is under the limit.
-/// Skips directories that are protected, have pending writes, or have open file handles.
+/// Skips directories that are protected or have pending writes.
+/// Returns the list of evicted directory names.
 pub fn evict_lru(
     cache_dir: &Path,
     db: &CacheDB,
     max_cache_bytes: u64,
     protect_dir: Option<&str>,
-) {
+) -> Vec<String> {
+    let mut evicted = Vec::new();
     let initial_total = db.total_size().unwrap_or(0);
     if initial_total > max_cache_bytes {
         info!(
@@ -189,8 +191,10 @@ pub fn evict_lru(
         }
 
         // Remove from DB
+        evicted.push(victim.dir_path.clone());
         let _ = db.remove_dir(&victim.dir_path);
     }
+    evicted
 }
 
 /// Clean up stale state on startup:
@@ -291,6 +295,8 @@ pub struct CacheWorker {
     completed_rx: Mutex<mpsc::Receiver<String>>,
     /// Receive directory names found to have no photos.
     empty_rx: Mutex<mpsc::Receiver<String>>,
+    /// Receive directory names that were evicted.
+    evicted_rx: Mutex<mpsc::Receiver<String>>,
 }
 
 impl CacheWorker {
@@ -304,6 +310,7 @@ impl CacheWorker {
         let (tx, rx) = mpsc::channel::<String>();
         let (completed_tx, completed_rx) = mpsc::channel::<String>();
         let (empty_tx, empty_rx) = mpsc::channel::<String>();
+        let (evicted_tx, evicted_rx) = mpsc::channel::<String>();
 
         thread::spawn(move || {
             // Clean up any partial caches from previous interrupted runs
@@ -328,7 +335,9 @@ impl CacheWorker {
                 }
 
                 // Evict LRU dirs if over budget (protect the one we just cached)
-                evict_lru(&cache_dir, &db_guard, max_cache_bytes, Some(&dir_rel));
+                for evicted_dir in evict_lru(&cache_dir, &db_guard, max_cache_bytes, Some(&dir_rel)) {
+                    let _ = evicted_tx.send(evicted_dir);
+                }
             }
             info!("Cache worker shutting down");
         });
@@ -337,6 +346,7 @@ impl CacheWorker {
             tx,
             completed_rx: Mutex::new(completed_rx),
             empty_rx: Mutex::new(empty_rx),
+            evicted_rx: Mutex::new(evicted_rx),
         }
     }
 
@@ -348,6 +358,16 @@ impl CacheWorker {
     /// Drain any directories that have finished caching since the last call.
     pub fn drain_completed(&self) -> Vec<String> {
         let rx = self.completed_rx.lock().unwrap();
+        let mut dirs = Vec::new();
+        while let Ok(dir) = rx.try_recv() {
+            dirs.push(dir);
+        }
+        dirs
+    }
+
+    /// Drain directories that were evicted from cache.
+    pub fn drain_evicted(&self) -> Vec<String> {
+        let rx = self.evicted_rx.lock().unwrap();
         let mut dirs = Vec::new();
         while let Ok(dir) = rx.try_recv() {
             dirs.push(dir);
