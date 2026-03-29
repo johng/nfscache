@@ -1,10 +1,10 @@
-# photocache
+# nfscache
 
 Browse your entire NAS photo library as if it were local. No waiting, no manual syncing, no duplicates.
 
-photocache is a FUSE filesystem for macOS that mounts your NAS photos as a regular folder. Photos you actually look at get cached locally for instant access. Everything else streams transparently from the NAS. Write a photo and it saves to your local disk immediately, then syncs to the NAS in the background within seconds.
+nfscache is a FUSE filesystem for macOS that mounts your NAS photos as a regular folder. Photos you actually look at get cached locally for instant access. Everything else streams transparently from the NAS. Write a photo and it saves to your local disk immediately, then syncs to the NAS in the background within seconds.
 
-**Why?** NAS photo libraries are slow to browse. Cloud sync tools copy everything. photocache gives you the speed of local storage with the capacity of your NAS, using only the disk space you choose.
+**Why?** NAS photo libraries are slow to browse. Cloud sync tools copy everything. nfscache gives you the speed of local storage with the capacity of your NAS, using only the disk space you choose.
 
 ## Features
 
@@ -28,7 +28,7 @@ make install
 
 # Mount your NAS and start browsing
 sudo mount -t nfs -o vers=3,nolock,resvport 192.168.50.21:/volume1/media ~/nas_media
-photocache mount
+nfscache mount
 ```
 
 Open `~/NAS Pictures` in Finder. Directories cache automatically as you browse.
@@ -50,21 +50,21 @@ Open `~/NAS Pictures` in Finder. Directories cache automatically as you browse.
 
 | Command | Description |
 |---------|-------------|
-| `photocache mount` | Mount the FUSE filesystem |
-| `photocache unmount` | Unmount the filesystem |
-| `photocache status` | Show cache usage, cached directories, pending writes |
-| `photocache init` | Create config file and cache directories |
-| `photocache clear` | Wipe the local cache (unmount first) |
+| `nfscache mount` | Mount the FUSE filesystem |
+| `nfscache unmount` | Unmount the filesystem |
+| `nfscache status` | Show cache usage, cached directories, pending writes |
+| `nfscache init` | Create config file and cache directories |
+| `nfscache clear` | Wipe the local cache (unmount first) |
 
 ## Configuration
 
-Config is created at `~/.photo_cache/config.json` on first `init`:
+Config is created at `~/.nfscache/config.json` on first `init`:
 
 ```json
 {
   "nas_photos_path": "/Users/johng/nas_media/photos",
-  "cache_dir": "/Users/johng/.photo_cache/data",
-  "db_path": "/Users/johng/.photo_cache/cache.db",
+  "cache_dir": "/Users/johng/.nfscache/data",
+  "db_path": "/Users/johng/.nfscache/cache.db",
   "mount_point": "/Users/johng/NAS Pictures",
   "max_cache_bytes": 53687091200
 }
@@ -74,7 +74,7 @@ Config is created at `~/.photo_cache/config.json` on first `init`:
 
 ## Background service
 
-Run photocache automatically at login:
+Run nfscache automatically at login:
 
 ```bash
 make service-start    # install and start
@@ -86,13 +86,13 @@ make service-restart  # restart after config changes
 
 ```bash
 # Recommended: cache operations
-RUST_LOG=photocache::sync=info photocache mount
+RUST_LOG=nfscache::sync=info nfscache mount
 
 # Verbose: per-file detail
-RUST_LOG=photocache::sync=debug photocache mount
+RUST_LOG=nfscache::sync=debug nfscache mount
 ```
 
-Service logs: `~/Library/Logs/photocache/`
+Service logs: `~/Library/Logs/nfscache/`
 
 ## How it works
 
@@ -124,9 +124,9 @@ jpg, jpeg, png, heic, heif, dng, raw, tiff, tif, cr2, nef, arw, aae, xmp, mov
 
 **rclone** connects to cloud APIs (HTTP) where random reads aren't possible, so it downloads files to a local cache to make `seek`/`read` work at all. The cache exists for *correctness*, not speed. Each file is cached individually as accessed.
 
-**photocache** sits on top of an existing NFS mount where reads already work. The cache exists purely for *speed*. When you open one photo, the entire directory is pre-fetched in the background so the next photo is instant. This matches how people actually browse photos — flipping through a folder, not jumping between random files.
+**nfscache** sits on top of an existing NFS mount where reads already work. The cache exists purely for *speed*. When you open one photo, the entire directory is pre-fetched in the background so the next photo is instant. This matches how people actually browse photos — flipping through a folder, not jumping between random files.
 
-| | photocache | rclone mount |
+| | nfscache | rclone mount |
 |---|---|---|
 | Backend | NFS mount (already works) | Cloud APIs (S3, SFTP, WebDAV) |
 | Cache purpose | Speed (prefetch for browsing) | Correctness (make seeks work) |
@@ -135,7 +135,7 @@ jpg, jpeg, png, heic, heif, dng, raw, tiff, tif, cr2, nef, arw, aae, xmp, mov
 | Finder tags | Green/orange cache indicators | No |
 | Write model | Local-first, async flush | Write-through or full cache |
 
-Use rclone if your photos are in cloud storage. Use photocache if they're on a NAS.
+Use rclone if your photos are in cloud storage. Use nfscache if they're on a NAS.
 
 ## Requirements
 

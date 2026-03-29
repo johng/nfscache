@@ -3,10 +3,10 @@
 <plist version="1.0">
 <dict>
     <key>Label</key>
-    <string>com.johng.photocache-mount</string>
+    <string>com.johng.nfscache-mount</string>
     <key>ProgramArguments</key>
     <array>
-        <string>/usr/local/bin/photocache</string>
+        <string>/usr/local/bin/nfscache</string>
         <string>mount</string>
     </array>
     <key>RunAtLoad</key>
@@ -18,11 +18,11 @@
     <key>EnvironmentVariables</key>
     <dict>
         <key>RUST_LOG</key>
-        <string>photocache::sync=info</string>
+        <string>nfscache::sync=info</string>
     </dict>
     <key>StandardOutPath</key>
-    <string>/Users/johng/Library/Logs/photocache/mount.log</string>
+    <string>/Users/johng/Library/Logs/nfscache/mount.log</string>
     <key>StandardErrorPath</key>
-    <string>/Users/johng/Library/Logs/photocache/mount.err.log</string>
+    <string>/Users/johng/Library/Logs/nfscache/mount.err.log</string>
 </dict>
 </plist>

@@ -448,6 +448,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "nfscache"
+version = "0.1.0"
+dependencies = [
+ "clap",
+ "dirs",
+ "env_logger",
+ "filetime",
+ "fuser",
+ "libc",
+ "log",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "walkdir",
+]
+
+[[package]]
 name = "nix"
 version = "0.30.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -531,24 +549,6 @@ dependencies = [
  "redox_syscall 0.5.18",
  "smallvec",
  "windows-link",
-]
-
-[[package]]
-name = "photocache"
-version = "0.1.0"
-dependencies = [
- "clap",
- "dirs",
- "env_logger",
- "filetime",
- "fuser",
- "libc",
- "log",
- "rusqlite",
- "serde",
- "serde_json",
- "tempfile",
- "walkdir",
 ]
 
 [[package]]

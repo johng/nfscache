@@ -15,8 +15,8 @@ impl Default for Config {
         let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("/tmp"));
         Self {
             nas_photos_path: home.join("nas_media/photos"),
-            cache_dir: home.join(".photo_cache/data"),
-            db_path: home.join(".photo_cache/cache.db"),
+            cache_dir: home.join(".nfscache/data"),
+            db_path: home.join(".nfscache/cache.db"),
             mount_point: home.join("Photos"),
             max_cache_bytes: 53_687_091_200, // 50 GB
         }

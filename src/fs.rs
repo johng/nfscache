@@ -90,7 +90,7 @@ struct OpenFileHandle {
     dirty: bool,
 }
 
-pub struct PhotoCacheFS {
+pub struct NfsCacheFS {
     nas_path: PathBuf,
     cache_dir: PathBuf,
     inodes: Mutex<InodeMap>,
@@ -109,7 +109,7 @@ pub struct PhotoCacheFS {
     gid: u32,
 }
 
-impl PhotoCacheFS {
+impl NfsCacheFS {
     pub fn new(
         nas_path: PathBuf,
         cache_dir: PathBuf,
@@ -136,7 +136,7 @@ impl PhotoCacheFS {
             }
         }
 
-        PhotoCacheFS {
+        NfsCacheFS {
             nas_path,
             cache_dir,
             inodes: Mutex::new(InodeMap::new()),
@@ -418,7 +418,7 @@ impl PhotoCacheFS {
     }
 }
 
-impl Filesystem for PhotoCacheFS {
+impl Filesystem for NfsCacheFS {
     fn lookup(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEntry) {
         let name_str = match name.to_str() {
             Some(n) => n,
@@ -1354,7 +1354,7 @@ impl Filesystem for PhotoCacheFS {
 
 }
 
-/// Mount the PhotoCacheFS at the given mount point.
+/// Mount the NfsCacheFS at the given mount point.
 /// If the mount point is already a FUSE mount, unmount it first.
 pub fn mount(
     nas_path: PathBuf,
@@ -1397,10 +1397,10 @@ pub fn mount(
         )
     };
 
-    let filesystem = PhotoCacheFS::new(nas_path, cache_dir, db, Some(worker), Some(flush_worker));
+    let filesystem = NfsCacheFS::new(nas_path, cache_dir, db, Some(worker), Some(flush_worker));
     let mut config = Config::default();
     config.mount_options = vec![
-        MountOption::FSName("photocache".to_string()),
+        MountOption::FSName("nfscache".to_string()),
     ];
     if let Err(e) = fuser::mount2(filesystem, mount_point, &config) {
         eprintln!("Failed to mount at {}: {}", mount_point.display(), e);
@@ -1463,7 +1463,7 @@ mod tests {
         fs::write(nas.join("photo.jpg"), b"nas-version").unwrap();
         fs::write(cache.join("photo.jpg"), b"cache-version").unwrap();
 
-        let fs = PhotoCacheFS::new(nas.clone(), cache.clone(), None, None, None);
+        let fs = NfsCacheFS::new(nas.clone(), cache.clone(), None, None, None);
         let resolved = fs.resolve("photo.jpg").unwrap();
         assert_eq!(resolved, cache.join("photo.jpg"));
     }
@@ -1479,7 +1479,7 @@ mod tests {
         // File only on NAS
         fs::write(nas.join("photo.jpg"), b"nas-only").unwrap();
 
-        let fs = PhotoCacheFS::new(nas.clone(), cache.clone(), None, None, None);
+        let fs = NfsCacheFS::new(nas.clone(), cache.clone(), None, None, None);
         let resolved = fs.resolve("photo.jpg").unwrap();
         assert_eq!(resolved, nas.join("photo.jpg"));
     }
@@ -1492,7 +1492,7 @@ mod tests {
         fs::create_dir_all(&nas).unwrap();
         fs::create_dir_all(&cache).unwrap();
 
-        let fs = PhotoCacheFS::new(nas, cache, None, None, None);
+        let fs = NfsCacheFS::new(nas, cache, None, None, None);
         assert!(fs.resolve("nonexistent.jpg").is_none());
     }
 
@@ -1508,7 +1508,7 @@ mod tests {
         fs::write(nas.join("a.jpg"), b"aaa").unwrap();
         fs::write(cache.join("b.jpg"), b"bbb").unwrap();
 
-        let fs = PhotoCacheFS::new(nas, cache, None, None, None);
+        let fs = NfsCacheFS::new(nas, cache, None, None, None);
         let entries = fs.list_dir("");
         let names: HashSet<String> = entries.into_iter().map(|(n, _)| n).collect();
         assert!(names.contains("a.jpg"));
@@ -1527,7 +1527,7 @@ mod tests {
         fs::write(nas.join("photo.jpg"), b"nas").unwrap();
         fs::write(cache.join("photo.jpg"), b"cache").unwrap();
 
-        let fs = PhotoCacheFS::new(nas, cache, None, None, None);
+        let fs = NfsCacheFS::new(nas, cache, None, None, None);
         let entries = fs.list_dir("");
         let names: Vec<String> = entries.into_iter().map(|(n, _)| n).collect();
         assert_eq!(names.iter().filter(|n| *n == "photo.jpg").count(), 1);
@@ -1535,9 +1535,9 @@ mod tests {
 
     #[test]
     fn test_join_rel() {
-        assert_eq!(PhotoCacheFS::join_rel("", "file.jpg"), "file.jpg");
+        assert_eq!(NfsCacheFS::join_rel("", "file.jpg"), "file.jpg");
         assert_eq!(
-            PhotoCacheFS::join_rel("March 2026", "IMG_001.jpg"),
+            NfsCacheFS::join_rel("March 2026", "IMG_001.jpg"),
             "March 2026/IMG_001.jpg"
         );
     }
@@ -1546,26 +1546,26 @@ mod tests {
 
     #[test]
     fn test_is_hidden_entry_synology() {
-        assert!(PhotoCacheFS::is_hidden_entry("@eaDir"));
+        assert!(NfsCacheFS::is_hidden_entry("@eaDir"));
     }
 
     #[test]
     fn test_is_hidden_entry_resource_fork() {
-        assert!(PhotoCacheFS::is_hidden_entry("._IMG_001.jpg"));
-        assert!(PhotoCacheFS::is_hidden_entry("._photo.heic"));
+        assert!(NfsCacheFS::is_hidden_entry("._IMG_001.jpg"));
+        assert!(NfsCacheFS::is_hidden_entry("._photo.heic"));
     }
 
     #[test]
     fn test_is_hidden_entry_syno_files() {
-        assert!(PhotoCacheFS::is_hidden_entry("@SynoResource"));
-        assert!(PhotoCacheFS::is_hidden_entry("file@SynoExt"));
+        assert!(NfsCacheFS::is_hidden_entry("@SynoResource"));
+        assert!(NfsCacheFS::is_hidden_entry("file@SynoExt"));
     }
 
     #[test]
     fn test_is_hidden_entry_normal_files() {
-        assert!(!PhotoCacheFS::is_hidden_entry("IMG_001.jpg"));
-        assert!(!PhotoCacheFS::is_hidden_entry("March 2026"));
-        assert!(!PhotoCacheFS::is_hidden_entry(".hidden_dir"));
+        assert!(!NfsCacheFS::is_hidden_entry("IMG_001.jpg"));
+        assert!(!NfsCacheFS::is_hidden_entry("March 2026"));
+        assert!(!NfsCacheFS::is_hidden_entry(".hidden_dir"));
     }
 
     // --- is_file_cached tests ---
@@ -1579,7 +1579,7 @@ mod tests {
         fs::create_dir_all(cache.join("March 2026")).unwrap();
         fs::write(cache.join("March 2026/IMG_001.jpg"), b"data").unwrap();
 
-        let fsys = PhotoCacheFS::new(nas, cache, None, None, None);
+        let fsys = NfsCacheFS::new(nas, cache, None, None, None);
         assert!(fsys.is_file_cached("March 2026/IMG_001.jpg"));
     }
 
@@ -1591,7 +1591,7 @@ mod tests {
         fs::create_dir_all(&nas).unwrap();
         fs::create_dir_all(&cache).unwrap();
 
-        let fsys = PhotoCacheFS::new(nas, cache, None, None, None);
+        let fsys = NfsCacheFS::new(nas, cache, None, None, None);
         assert!(!fsys.is_file_cached("March 2026/IMG_001.jpg"));
     }
 
@@ -1603,7 +1603,7 @@ mod tests {
         fs::create_dir_all(&nas).unwrap();
         fs::create_dir_all(&cache).unwrap();
 
-        let fsys = PhotoCacheFS::new(nas, cache, None, None, None);
+        let fsys = NfsCacheFS::new(nas, cache, None, None, None);
         assert!(!fsys.is_file_cached(""), "empty path should not be cached");
         assert!(!fsys.is_file_cached("toplevel.jpg"), "bare filename without dir should not be cached");
     }
@@ -1621,7 +1621,7 @@ mod tests {
         let db = crate::cache_db::CacheDB::open(Path::new(":memory:")).unwrap();
         db.touch_dir("March 2026", 5000).unwrap();
 
-        let fsys = PhotoCacheFS::new(nas, cache, Some(db), None, None);
+        let fsys = NfsCacheFS::new(nas, cache, Some(db), None, None);
         assert!(fsys.is_cached("March 2026"));
     }
 
@@ -1636,7 +1636,7 @@ mod tests {
         let db = crate::cache_db::CacheDB::open(Path::new(":memory:")).unwrap();
         db.touch_dir("March 2026", 5000).unwrap();
 
-        let fsys = PhotoCacheFS::new(nas, cache, Some(db), None, None);
+        let fsys = NfsCacheFS::new(nas, cache, Some(db), None, None);
         assert!(fsys.is_cached("March 2026/IMG_001.jpg"));
     }
 
@@ -1648,7 +1648,7 @@ mod tests {
         fs::create_dir_all(&nas).unwrap();
         fs::create_dir_all(&cache).unwrap();
 
-        let fsys = PhotoCacheFS::new(nas, cache, None, None, None);
+        let fsys = NfsCacheFS::new(nas, cache, None, None, None);
         assert!(!fsys.is_cached("Uncached Dir"));
         assert!(!fsys.is_cached("Uncached Dir/photo.jpg"));
         assert!(!fsys.is_cached(""), "root should not be cached");
@@ -1658,23 +1658,23 @@ mod tests {
 
     #[test]
     fn test_parent_dir_with_file_in_dir() {
-        assert_eq!(PhotoCacheFS::parent_dir("March 2026/IMG_001.jpg"), Some("March 2026"));
+        assert_eq!(NfsCacheFS::parent_dir("March 2026/IMG_001.jpg"), Some("March 2026"));
     }
 
     #[test]
     fn test_parent_dir_bare_name() {
-        assert_eq!(PhotoCacheFS::parent_dir("toplevel"), None);
+        assert_eq!(NfsCacheFS::parent_dir("toplevel"), None);
     }
 
     #[test]
     fn test_parent_dir_empty() {
-        assert_eq!(PhotoCacheFS::parent_dir(""), None);
+        assert_eq!(NfsCacheFS::parent_dir(""), None);
     }
 
     #[test]
     fn test_parent_dir_nested() {
         // Returns the immediate parent directory
-        assert_eq!(PhotoCacheFS::parent_dir("a/b/c"), Some("a/b"));
+        assert_eq!(NfsCacheFS::parent_dir("a/b/c"), Some("a/b"));
     }
 
     // --- make_finder_info tests ---
@@ -1725,7 +1725,7 @@ mod tests {
         fs::create_dir_all(nas.join("@eaDir")).unwrap();
         fs::write(nas.join("._photo.jpg"), b"resource fork").unwrap();
 
-        let fsys = PhotoCacheFS::new(nas, cache, None, None, None);
+        let fsys = NfsCacheFS::new(nas, cache, None, None, None);
         let entries = fsys.list_dir("");
         let names: Vec<String> = entries.into_iter().map(|(n, _)| n).collect();
         assert!(names.contains(&"photo.jpg".to_string()));

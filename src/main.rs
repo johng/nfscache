@@ -9,7 +9,7 @@ use std::path::PathBuf;
 
 #[derive(Parser)]
 #[command(
-    name = "photocache",
+    name = "nfscache",
     about = "Browse your NAS photo library as if it were local",
     version,
 )]
@@ -35,7 +35,7 @@ enum Commands {
 fn config_path() -> PathBuf {
     dirs::home_dir()
         .unwrap_or_else(|| PathBuf::from("/tmp"))
-        .join(".photo_cache/config.json")
+        .join(".nfscache/config.json")
 }
 
 fn is_mounted(config: &Config) -> bool {
@@ -89,7 +89,7 @@ fn cmd_mount(config: &Config, cp: &std::path::Path) {
 
     std::fs::create_dir_all(&config.cache_dir).ok();
 
-    println!("photocache v{}", env!("CARGO_PKG_VERSION"));
+    println!("nfscache v{}", env!("CARGO_PKG_VERSION"));
     println!("  NAS:    {}", config.nas_photos_path.display());
     println!("  Cache:  {} ({:.1} GB limit)", config.cache_dir.display(), config.max_cache_bytes as f64 / 1e9);
     println!("  Mount:  {}", config.mount_point.display());
@@ -151,7 +151,7 @@ fn dir_disk_usage(path: &std::path::Path) -> (u64, usize) {
 }
 
 fn cmd_status(config: &Config) {
-    println!("photocache v{}", env!("CARGO_PKG_VERSION"));
+    println!("nfscache v{}", env!("CARGO_PKG_VERSION"));
     println!();
 
     // Mount status
@@ -191,7 +191,7 @@ fn cmd_status(config: &Config) {
     let db = match cache_db::CacheDB::open(&config.db_path) {
         Ok(db) => db,
         Err(_) => {
-            println!("No cache database found. Run 'photocache init' first.");
+            println!("No cache database found. Run 'nfscache init' first.");
             return;
         }
     };
@@ -285,7 +285,7 @@ fn cmd_status(config: &Config) {
 
 fn cmd_clear(config: &Config) {
     if is_mounted(config) {
-        eprintln!("Error: filesystem is mounted. Run 'photocache unmount' first.");
+        eprintln!("Error: filesystem is mounted. Run 'nfscache unmount' first.");
         std::process::exit(1);
     }
 
@@ -343,6 +343,6 @@ fn cmd_init(config: &Config) {
     println!("  Cache limit: {:.1} GB", config.max_cache_bytes as f64 / 1e9);
 
     if !config.nas_photos_path.exists() {
-        println!("\n  Note: NAS path does not exist yet. Mount your NAS before running 'photocache mount'.");
+        println!("\n  Note: NAS path does not exist yet. Mount your NAS before running 'nfscache mount'.");
     }
 }
