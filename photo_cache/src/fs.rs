@@ -228,6 +228,9 @@ impl PhotoCacheFS {
                     pending.remove(&path);
                 }
             }
+            for dir in flush.drain_invalidated() {
+                self.cached_dirs.lock().unwrap().remove(&dir);
+            }
         }
 
         if let Some(dir) = Self::parent_dir(rel_path) {
@@ -1032,6 +1035,14 @@ impl Filesystem for PhotoCacheFS {
             info!("  Cache: removed");
         }
 
+        // Remove from in-memory tracking
+        self.cached_dirs.lock().unwrap().remove(&child_rel);
+        self.empty_dirs.lock().unwrap().remove(&child_rel);
+        if let Some(ref db) = self.db {
+            let db = db.lock().unwrap();
+            let _ = db.remove_dir(&child_rel);
+        }
+
         self.inodes.lock().unwrap().remove_path(&child_rel);
         reply.ok();
     }
@@ -1111,6 +1122,43 @@ impl Filesystem for PhotoCacheFS {
         }
 
         self.db_rename(&old_rel, &new_rel);
+
+        // Update in-memory cache tracking
+        {
+            let mut dirs = self.cached_dirs.lock().unwrap();
+            if dirs.remove(&old_rel) {
+                dirs.insert(new_rel.clone());
+            }
+        }
+        {
+            let mut dirs = self.empty_dirs.lock().unwrap();
+            if dirs.remove(&old_rel) {
+                dirs.insert(new_rel.clone());
+            }
+        }
+        // Update pending writes that start with old path
+        {
+            let mut pending = self.pending_writes.lock().unwrap();
+            let old_prefix = format!("{}/", old_rel);
+            let to_rename: Vec<String> = pending.iter()
+                .filter(|p| p.starts_with(&old_prefix) || **p == old_rel)
+                .cloned()
+                .collect();
+            for old_path in &to_rename {
+                pending.remove(old_path);
+                let new_path = format!("{}{}", new_rel, &old_path[old_rel.len()..]);
+                pending.insert(new_path);
+            }
+        }
+        // Update DB directory entry
+        if let Some(ref db) = self.db {
+            let db = db.lock().unwrap();
+            if db.is_dir_cached(&old_rel).unwrap_or(false) {
+                let _ = db.remove_dir(&old_rel);
+                let _ = db.touch_dir(&new_rel, 0);
+            }
+        }
+
         info!("  DB: updated");
         self.inodes.lock().unwrap().rename(&old_rel, &new_rel);
         reply.ok();

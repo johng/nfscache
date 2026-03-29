@@ -390,6 +390,8 @@ impl CacheWorker {
 pub struct WriteFlushWorker {
     _handle: thread::JoinHandle<()>,
     flushed_rx: Mutex<mpsc::Receiver<String>>,
+    /// Directories invalidated because they no longer exist on NAS.
+    invalidated_rx: Mutex<mpsc::Receiver<String>>,
 }
 
 impl WriteFlushWorker {
@@ -401,10 +403,13 @@ impl WriteFlushWorker {
         max_cache_bytes: u64,
     ) -> Self {
         let (flushed_tx, flushed_rx) = mpsc::channel::<String>();
+        let (invalidated_tx, invalidated_rx) = mpsc::channel::<String>();
 
         let handle = thread::spawn(move || {
+            let mut cycle_count = 0u64;
             loop {
                 thread::sleep(flush_interval);
+                cycle_count += 1;
 
                 // Collect pending paths while holding the lock briefly
                 let pending = {
@@ -451,13 +456,43 @@ impl WriteFlushWorker {
                     let db_guard = db.lock().unwrap();
                     evict_lru(&cache_dir, &db_guard, max_cache_bytes, None);
                 }
+
+                // Every ~60 seconds, verify cached directories still exist on NAS
+                if cycle_count % 12 == 0 {
+                    let db_guard = db.lock().unwrap();
+                    if let Ok(dirs) = db_guard.lru_directories() {
+                        for dir in &dirs {
+                            let nas_dir = nas_path.join(&dir.dir_path);
+                            if !nas_dir.exists() {
+                                info!("Directory removed from NAS, invalidating cache: {}", dir.dir_path);
+                                let cache_path = cache_dir.join(&dir.dir_path);
+                                if cache_path.is_dir() {
+                                    let _ = fs::remove_dir_all(&cache_path);
+                                }
+                                let _ = db_guard.remove_dir(&dir.dir_path);
+                                let _ = invalidated_tx.send(dir.dir_path.clone());
+                            }
+                        }
+                    }
+                }
             }
         });
 
         WriteFlushWorker {
             _handle: handle,
             flushed_rx: Mutex::new(flushed_rx),
+            invalidated_rx: Mutex::new(invalidated_rx),
         }
+    }
+
+    /// Drain directories invalidated by NAS-side changes.
+    pub fn drain_invalidated(&self) -> Vec<String> {
+        let rx = self.invalidated_rx.lock().unwrap();
+        let mut dirs = Vec::new();
+        while let Ok(dir) = rx.try_recv() {
+            dirs.push(dir);
+        }
+        dirs
     }
 
     /// Drain flushed file paths to update in-memory state.
