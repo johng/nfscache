@@ -85,18 +85,27 @@ fn cmd_status(config: &Config) {
 
     let db = cache_db::CacheDB::open(&config.db_path).expect("Failed to open cache DB");
 
-    // Show cached directories with actual disk sizes
+    // Show cached directories with actual disk sizes (skip empty ones)
     let cached_dirs = db.lru_directories().unwrap_or_default();
-    if !cached_dirs.is_empty() {
+    let mut shown_dirs = Vec::new();
+    for dir in cached_dirs.iter().rev() {
+        let dir_path = config.cache_dir.join(&dir.dir_path);
+        let (actual_size, file_count) = dir_disk_usage(&dir_path);
+        if file_count > 0 {
+            shown_dirs.push((&dir.dir_path, actual_size, file_count));
+        } else {
+            // Clean up stale empty directory entry
+            db.remove_dir(&dir.dir_path).ok();
+        }
+    }
+    if !shown_dirs.is_empty() {
         println!("\nCached directories (most recent first):");
-        for dir in cached_dirs.iter().rev() {
-            let dir_path = config.cache_dir.join(&dir.dir_path);
-            let (actual_size, file_count) = dir_disk_usage(&dir_path);
+        for (path, size, count) in &shown_dirs {
             println!(
                 "  {} ({:.1} MB, {} files)",
-                dir.dir_path,
-                actual_size as f64 / 1e6,
-                file_count,
+                path,
+                *size as f64 / 1e6,
+                count,
             );
         }
     }
@@ -120,7 +129,10 @@ fn cmd_status(config: &Config) {
                 .filter_map(|e| e.ok())
                 .collect();
             let file_count = entries.iter()
-                .filter(|e| e.file_type().map(|t| t.is_file()).unwrap_or(false))
+                .filter(|e| {
+                    e.file_type().map(|t| t.is_file()).unwrap_or(false)
+                    && e.file_name() != ".DS_Store"
+                })
                 .count();
             let rel_str = rel.to_string();
             if !rel.is_empty() && !cached.contains(rel_str.as_str()) && file_count > 0 {
