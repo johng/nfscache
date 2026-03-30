@@ -1399,8 +1399,13 @@ pub fn mount(
 
     let filesystem = NfsCacheFS::new(nas_path, cache_dir, db, Some(worker), Some(flush_worker));
     let mut config = Config::default();
+    let vol_name = mount_point
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "nfscache".to_string());
     config.mount_options = vec![
         MountOption::FSName("nfscache".to_string()),
+        MountOption::CUSTOM(format!("volname={}", vol_name)),
     ];
     if let Err(e) = fuser::mount2(filesystem, mount_point, &config) {
         eprintln!("Failed to mount at {}: {}", mount_point.display(), e);
