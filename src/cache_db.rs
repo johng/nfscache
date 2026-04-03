@@ -9,6 +9,7 @@ pub struct CacheEntry {
     pub size: u64,
     pub mtime: f64,
     pub cached_at: f64,
+    pub checksum: Option<String>,
 }
 
 #[allow(dead_code)]
@@ -37,7 +38,8 @@ impl CacheDB {
                 path TEXT PRIMARY KEY,
                 size INTEGER NOT NULL,
                 mtime REAL NOT NULL,
-                cached_at REAL NOT NULL
+                cached_at REAL NOT NULL,
+                checksum TEXT
             );
             CREATE TABLE IF NOT EXISTS directories (
                 dir_path TEXT PRIMARY KEY,
@@ -49,20 +51,23 @@ impl CacheDB {
                 created_at REAL NOT NULL
             );"
         )?;
+        // Migration: add checksum column to existing databases
+        let _ = conn.execute_batch("ALTER TABLE cache ADD COLUMN checksum TEXT");
+
         Ok(Self { conn })
     }
 
-    pub fn add(&self, path: &str, size: u64, mtime: f64) -> rusqlite::Result<()> {
+    pub fn add(&self, path: &str, size: u64, mtime: f64, checksum: Option<&str>) -> rusqlite::Result<()> {
         self.conn.execute(
-            "INSERT OR REPLACE INTO cache (path, size, mtime, cached_at) VALUES (?1, ?2, ?3, ?4)",
-            params![path, size as i64, mtime, now_secs()],
+            "INSERT OR REPLACE INTO cache (path, size, mtime, cached_at, checksum) VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![path, size as i64, mtime, now_secs(), checksum],
         )?;
         Ok(())
     }
 
     pub fn get(&self, path: &str) -> rusqlite::Result<Option<CacheEntry>> {
         let mut stmt = self.conn.prepare(
-            "SELECT path, size, mtime, cached_at FROM cache WHERE path = ?1"
+            "SELECT path, size, mtime, cached_at, checksum FROM cache WHERE path = ?1"
         )?;
         let mut rows = stmt.query_map(params![path], |row| {
             Ok(CacheEntry {
@@ -70,6 +75,7 @@ impl CacheDB {
                 size: row.get::<_, i64>(1)? as u64,
                 mtime: row.get(2)?,
                 cached_at: row.get(3)?,
+                checksum: row.get(4)?,
             })
         })?;
         match rows.next() {
@@ -207,7 +213,7 @@ mod tests {
     #[test]
     fn test_add_and_get() {
         let db = test_db();
-        db.add("March 2026/IMG_001.jpg", 5_000_000, 1_700_000_000.0).unwrap();
+        db.add("March 2026/IMG_001.jpg", 5_000_000, 1_700_000_000.0, None).unwrap();
         let entry = db.get("March 2026/IMG_001.jpg").unwrap().unwrap();
         assert_eq!(entry.size, 5_000_000);
         assert_eq!(entry.mtime, 1_700_000_000.0);
@@ -222,7 +228,7 @@ mod tests {
     #[test]
     fn test_remove() {
         let db = test_db();
-        db.add("test.jpg", 100, 1_700_000_000.0).unwrap();
+        db.add("test.jpg", 100, 1_700_000_000.0, None).unwrap();
         db.remove("test.jpg").unwrap();
         assert!(db.get("test.jpg").unwrap().is_none());
     }
@@ -230,16 +236,16 @@ mod tests {
     #[test]
     fn test_total_size() {
         let db = test_db();
-        db.add("a.jpg", 1000, 1_700_000_000.0).unwrap();
-        db.add("b.jpg", 2000, 1_700_000_001.0).unwrap();
+        db.add("a.jpg", 1000, 1_700_000_000.0, None).unwrap();
+        db.add("b.jpg", 2000, 1_700_000_001.0, None).unwrap();
         assert_eq!(db.total_size().unwrap(), 3000);
     }
 
     #[test]
     fn test_all_cached_paths() {
         let db = test_db();
-        db.add("a.jpg", 100, 1_700_000_000.0).unwrap();
-        db.add("b.jpg", 200, 1_700_000_001.0).unwrap();
+        db.add("a.jpg", 100, 1_700_000_000.0, None).unwrap();
+        db.add("b.jpg", 200, 1_700_000_001.0, None).unwrap();
         let paths = db.all_cached_paths().unwrap();
         assert!(paths.contains("a.jpg"));
         assert!(paths.contains("b.jpg"));
@@ -248,8 +254,8 @@ mod tests {
     #[test]
     fn test_update_existing() {
         let db = test_db();
-        db.add("a.jpg", 100, 1_700_000_000.0).unwrap();
-        db.add("a.jpg", 200, 1_700_000_001.0).unwrap();
+        db.add("a.jpg", 100, 1_700_000_000.0, None).unwrap();
+        db.add("a.jpg", 200, 1_700_000_001.0, None).unwrap();
         let entry = db.get("a.jpg").unwrap().unwrap();
         assert_eq!(entry.size, 200);
         assert_eq!(entry.mtime, 1_700_000_001.0);
@@ -271,9 +277,9 @@ mod tests {
     #[test]
     fn test_remove_dir() {
         let db = test_db();
-        db.add("March 2026/a.jpg", 100, 1.0).unwrap();
-        db.add("March 2026/b.jpg", 200, 2.0).unwrap();
-        db.add("April 2026/c.jpg", 300, 3.0).unwrap();
+        db.add("March 2026/a.jpg", 100, 1.0, None).unwrap();
+        db.add("March 2026/b.jpg", 200, 2.0, None).unwrap();
+        db.add("April 2026/c.jpg", 300, 3.0, None).unwrap();
         db.touch_dir("March 2026", 300).unwrap();
         db.touch_dir("April 2026", 300).unwrap();
 
@@ -375,7 +381,7 @@ mod tests {
     #[test]
     fn test_remove_dir_does_not_clean_pending_writes() {
         let db = test_db();
-        db.add("March 2026/a.jpg", 100, 1.0).unwrap();
+        db.add("March 2026/a.jpg", 100, 1.0, None).unwrap();
         db.touch_dir("March 2026", 100).unwrap();
         db.add_pending_write("March 2026/a.jpg").unwrap();
 

@@ -239,7 +239,7 @@ impl NfsCacheFS {
     fn db_add(&self, rel_path: &str, size: u64, mtime: f64) {
         if let Some(ref db) = self.db {
             let db = db.lock().unwrap();
-            if let Err(e) = db.add(rel_path, size, mtime) {
+            if let Err(e) = db.add(rel_path, size, mtime, None) {
                 warn!("Failed to update cache DB for {}: {}", rel_path, e);
             }
         }
@@ -262,7 +262,7 @@ impl NfsCacheFS {
             let info = db.get(old_path).ok().flatten();
             let _ = db.remove(old_path);
             if let Some(entry) = info {
-                let _ = db.add(new_path, entry.size, entry.mtime);
+                let _ = db.add(new_path, entry.size, entry.mtime, entry.checksum.as_deref());
             }
         }
     }

@@ -1,7 +1,10 @@
 // src/sync.rs
 use crate::cache_db::CacheDB;
 use log::{debug, info, warn};
-use std::fs;
+use sha2::{Sha256, Digest};
+use std::collections::HashMap;
+use std::fs::{self, File};
+use std::io::{self, Read as _};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 use std::sync::Arc;
@@ -32,6 +35,70 @@ fn is_photo(path: &Path) -> bool {
         .unwrap_or(false)
 }
 
+/// Result of a successful safe_copy: size in bytes and SHA-256 hex digest.
+pub struct CopyResult {
+    pub size: u64,
+    pub checksum: String,
+}
+
+/// Compute SHA-256 hex digest of a file.
+fn sha256_file(path: &Path) -> io::Result<String> {
+    let mut file = File::open(path)?;
+    let mut hasher = Sha256::new();
+    let mut buf = [0u8; 64 * 1024];
+    loop {
+        let n = file.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+    }
+    Ok(format!("{:x}", hasher.finalize()))
+}
+
+/// Copy a file safely: write to a temp file, verify size, compute checksum, then
+/// atomically rename to the final destination. Returns size and checksum on success.
+/// On failure, the temp file is cleaned up and no partial file is left at `dst`.
+fn safe_copy(src: &Path, dst: &Path) -> io::Result<CopyResult> {
+    let tmp = dst.with_extension("tmp");
+
+    // Copy to temp file
+    let size = match fs::copy(src, &tmp) {
+        Ok(s) => s,
+        Err(e) => {
+            let _ = fs::remove_file(&tmp);
+            return Err(e);
+        }
+    };
+
+    // Verify size matches source
+    let src_size = fs::metadata(src)?.len();
+    if size != src_size {
+        let _ = fs::remove_file(&tmp);
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("size mismatch: copied {} bytes but source is {} bytes", size, src_size),
+        ));
+    }
+
+    // Compute checksum of the copied file
+    let checksum = match sha256_file(&tmp) {
+        Ok(c) => c,
+        Err(e) => {
+            let _ = fs::remove_file(&tmp);
+            return Err(e);
+        }
+    };
+
+    // Atomic rename to final destination
+    if let Err(e) = fs::rename(&tmp, dst) {
+        let _ = fs::remove_file(&tmp);
+        return Err(e);
+    }
+
+    Ok(CopyResult { size, checksum })
+}
+
 /// Cache a single directory from NAS to local cache.
 /// Returns the total size of files cached, or 0 if cancelled/failed.
 /// Files are copied first, then recorded in the DB atomically at the end.
@@ -53,6 +120,7 @@ pub fn cache_directory(
         rel_path: String,
         size: u64,
         mtime: f64,
+        checksum: String,
     }
 
     let mut pending: Vec<PendingFile> = Vec::new();
@@ -94,12 +162,12 @@ pub fn cache_directory(
             fs::create_dir_all(parent).ok();
         }
 
-        // Copy the file
-        match fs::copy(path, &dst) {
-            Ok(size) => {
-                debug!("Cached: {} ({:.1} MB)", rel_path, size as f64 / 1e6);
-                pending.push(PendingFile { rel_path, size, mtime });
-                total_size += size;
+        // Copy the file safely (temp file + size verify + checksum + atomic rename)
+        match safe_copy(path, &dst) {
+            Ok(result) => {
+                debug!("Cached: {} ({:.1} MB, sha256:{})", rel_path, result.size as f64 / 1e6, &result.checksum[..8]);
+                pending.push(PendingFile { rel_path, size: result.size, mtime, checksum: result.checksum });
+                total_size += result.size;
             }
             Err(e) => {
                 warn!("Failed to cache {}: {}", rel_path, e);
@@ -111,7 +179,7 @@ pub fn cache_directory(
     // Record files in DB
     let cached_count = pending.len();
     for file in &pending {
-        db.add(&file.rel_path, file.size, file.mtime).ok();
+        db.add(&file.rel_path, file.size, file.mtime, Some(&file.checksum)).ok();
     }
 
     // Only mark directory as fully cached if there were photos and all succeeded
@@ -198,11 +266,28 @@ pub fn evict_lru(
 }
 
 /// Clean up stale state on startup:
+/// 0. Remove leftover .tmp files from interrupted safe_copy operations
 /// 1. Directories on disk without a DB entry (interrupted cache)
 /// 2. DB entries whose files don't exist on disk (stale from old runs)
 pub fn cleanup_stale_state(nas_path: &Path, cache_dir: &Path, db: &CacheDB) {
     if !cache_dir.is_dir() {
         return;
+    }
+
+    // 0. Remove leftover .tmp files from interrupted copies
+    let mut tmp_removed = 0u32;
+    for entry in WalkDir::new(cache_dir).into_iter().filter_map(|e| e.ok()) {
+        if entry.file_type().is_file() {
+            if let Some(ext) = entry.path().extension() {
+                if ext == "tmp" {
+                    let _ = fs::remove_file(entry.path());
+                    tmp_removed += 1;
+                }
+            }
+        }
+    }
+    if tmp_removed > 0 {
+        info!("Removed {} leftover .tmp files from interrupted copies", tmp_removed);
     }
 
     // Collect dirs that have pending writes — must not be deleted
@@ -407,6 +492,8 @@ impl WriteFlushWorker {
 
         let handle = thread::spawn(move || {
             let mut cycle_count = 0u64;
+            let mut retry_counts: HashMap<String, u32> = HashMap::new();
+            const MAX_BACKOFF_CYCLES: u32 = 64; // cap at ~5 min with 5s interval
             loop {
                 thread::sleep(flush_interval);
                 cycle_count += 1;
@@ -417,11 +504,27 @@ impl WriteFlushWorker {
                     db_guard.all_pending_writes().unwrap_or_default()
                 };
                 if pending.is_empty() {
+                    retry_counts.clear();
                     continue;
                 }
 
-                info!("Flushing {} pending writes to NAS", pending.len());
+                // Clean up retry state for paths no longer pending
+                retry_counts.retain(|k, _| pending.contains(k));
+
+                let mut attempted = 0u32;
+                let mut any_succeeded = false;
                 for rel_path in &pending {
+                    // Exponential backoff: skip if not enough cycles have passed
+                    let retries = retry_counts.get(rel_path).copied().unwrap_or(0);
+                    if retries > 0 && !any_succeeded {
+                        // If a file already succeeded this cycle, network is back —
+                        // skip backoff and retry everything immediately
+                        let backoff = (1u64 << retries.min(6)).min(MAX_BACKOFF_CYCLES as u64);
+                        if cycle_count % backoff != 0 {
+                            continue;
+                        }
+                    }
+
                     let src = cache_dir.join(rel_path);
                     let dst = nas_path.join(rel_path);
 
@@ -430,6 +533,7 @@ impl WriteFlushWorker {
                         db_guard.remove_pending_write(rel_path).ok();
                         debug!("Pending write removed (file gone): {}", rel_path);
                         let _ = flushed_tx.send(rel_path.clone());
+                        retry_counts.remove(rel_path);
                         continue;
                     }
 
@@ -437,18 +541,35 @@ impl WriteFlushWorker {
                         fs::create_dir_all(parent).ok();
                     }
 
-                    // Copy without holding the DB lock
-                    match fs::copy(&src, &dst) {
-                        Ok(size) => {
+                    // Clean up any partial file from a previous failed attempt
+                    let tmp = dst.with_extension("tmp");
+                    let _ = fs::remove_file(&tmp);
+
+                    // Safe copy: temp file + size verify + checksum + atomic rename
+                    match safe_copy(&src, &dst) {
+                        Ok(result) => {
                             let db_guard = db.lock().unwrap();
                             db_guard.remove_pending_write(rel_path).ok();
-                            info!("Flushed to NAS: {} ({:.1} MB)", rel_path, size as f64 / 1e6);
+                            info!("Flushed to NAS: {} ({:.1} MB, sha256:{})", rel_path, result.size as f64 / 1e6, &result.checksum[..8]);
                             let _ = flushed_tx.send(rel_path.clone());
+                            retry_counts.remove(rel_path);
+                            any_succeeded = true;
                         }
                         Err(e) => {
-                            warn!("Failed to flush to NAS {}: {} (will retry)", rel_path, e);
+                            let count = retry_counts.entry(rel_path.clone()).or_insert(0);
+                            *count = (*count + 1).min(MAX_BACKOFF_CYCLES);
+                            let backoff = (1u64 << (*count).min(6)).min(MAX_BACKOFF_CYCLES as u64);
+                            warn!("Failed to flush to NAS {}: {} (retry #{}, next in ~{}s)", rel_path, e, count, backoff * flush_interval.as_secs());
                         }
                     }
+                    attempted += 1;
+                }
+                if any_succeeded {
+                    // Network is back — reset all backoff so remaining files retry next cycle
+                    retry_counts.clear();
+                }
+                if attempted > 0 {
+                    info!("Flush cycle: attempted {} of {} pending writes", attempted, pending.len());
                 }
 
                 // After flushing, check if cache is over budget and evict if needed
@@ -648,7 +769,7 @@ mod tests {
         let db = CacheDB::open(Path::new(":memory:")).unwrap();
 
         // Add DB entry but no actual file on disk
-        db.add("March 2026/ghost.jpg", 100, 1.0).unwrap();
+        db.add("March 2026/ghost.jpg", 100, 1.0, None).unwrap();
 
         cleanup_stale_state(nas.path(), cache.path(), &db);
 
@@ -666,11 +787,11 @@ mod tests {
         let dir = cache.path().join("March 2026");
         fs::create_dir_all(&dir).unwrap();
         fs::write(dir.join("deleted_from_nas.jpg"), b"data").unwrap();
-        db.add("March 2026/deleted_from_nas.jpg", 100, 1.0).unwrap();
+        db.add("March 2026/deleted_from_nas.jpg", 100, 1.0, None).unwrap();
 
         // Also create a pending write file (also not on NAS — that's expected)
         fs::write(dir.join("pending.jpg"), b"new").unwrap();
-        db.add("March 2026/pending.jpg", 50, 2.0).unwrap();
+        db.add("March 2026/pending.jpg", 50, 2.0, None).unwrap();
         db.add_pending_write("March 2026/pending.jpg").unwrap();
 
         // Track the directory in DB so step 1 doesn't remove it as untracked
@@ -727,7 +848,7 @@ mod tests {
         // so create_dir_all for the parent fails and copy fails
         fs::write(cache.path().join("Bad Dir"), b"blocker").unwrap();
 
-        let size = cache_directory(nas.path(), cache.path(), "Bad Dir", &db);
+        let _size = cache_directory(nas.path(), cache.path(), "Bad Dir", &db);
 
         // The directory should NOT be marked as cached since copy failed
         assert!(!db.is_dir_cached("Bad Dir").unwrap(),
@@ -750,7 +871,7 @@ mod tests {
 
         {
             let db_guard = db.lock().unwrap();
-            db_guard.add("March 2026/new_photo.jpg", 10, 1.0).unwrap();
+            db_guard.add("March 2026/new_photo.jpg", 10, 1.0, None).unwrap();
             db_guard.add_pending_write("March 2026/new_photo.jpg").unwrap();
         }
 
