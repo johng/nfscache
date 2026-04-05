@@ -12,13 +12,14 @@ use log::{debug, error, info, warn};
 use std::collections::{HashMap, HashSet};
 use std::ffi::OsStr;
 use std::fs::{self, File, OpenOptions};
-use std::io::{Read, Seek, SeekFrom, Write};
+use std::io::{Seek, SeekFrom, Write};
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const TTL: Duration = Duration::from_secs(30);
+const DIR_LIST_CACHE_TTL: Duration = Duration::from_secs(30);
 const ROOT_INO: u64 = 1;
 const FINDER_INFO_XATTR: &str = "com.apple.FinderInfo";
 const FINDER_INFO_LEN: usize = 32;
@@ -103,8 +104,12 @@ pub struct NfsCacheFS {
     cached_dirs: Mutex<HashSet<String>>,
     /// Directories known to have no photos (avoid repeated cache attempts).
     empty_dirs: Mutex<HashSet<String>>,
+    /// Track last LRU touch time per directory to avoid DB writes on every open.
+    last_dir_touch: Mutex<HashMap<String, Instant>>,
     /// In-memory set of files pending NAS write.
     pending_writes: Mutex<HashSet<String>>,
+    /// Cached directory listings to avoid repeated NAS readdir calls.
+    dir_list_cache: Mutex<HashMap<String, (Instant, Vec<(String, FileType)>)>>,
     uid: u32,
     gid: u32,
 }
@@ -148,6 +153,8 @@ impl NfsCacheFS {
             cached_dirs: Mutex::new(initial_dirs),
             empty_dirs: Mutex::new(HashSet::new()),
             pending_writes: Mutex::new(initial_pending),
+            dir_list_cache: Mutex::new(HashMap::new()),
+            last_dir_touch: Mutex::new(HashMap::new()),
             uid,
             gid,
         }
@@ -221,10 +228,21 @@ impl NfsCacheFS {
             let already_cached = self.cached_dirs.lock().unwrap().contains(dir);
             let is_empty = self.empty_dirs.lock().unwrap().contains(dir);
             if already_cached {
-                // Touch the dir to update LRU
-                if let Some(ref db) = self.db {
-                    let db = db.lock().unwrap();
-                    let _ = db.touch_dir_access(dir);
+                // Touch the dir to update LRU — but only once per minute to avoid
+                // DB writes on every file open
+                let should_touch = {
+                    let mut last = self.last_dir_touch.lock().unwrap();
+                    let now = Instant::now();
+                    match last.get(dir) {
+                        Some(t) if now.duration_since(*t) < Duration::from_secs(60) => false,
+                        _ => { last.insert(dir.to_string(), now); true }
+                    }
+                };
+                if should_touch {
+                    if let Some(ref db) = self.db {
+                        let db = db.lock().unwrap();
+                        let _ = db.touch_dir_access(dir);
+                    }
                 }
             } else if !is_empty {
                 debug!("Requesting cache for directory: {}", dir);
@@ -268,10 +286,9 @@ impl NfsCacheFS {
     }
 
     /// Resolve a relative path to the actual filesystem path.
-    /// Checks cache first, then NAS.
+    /// Checks cache first, then NAS. Skips NAS for files in cached directories.
     fn resolve(&self, rel_path: &str) -> Option<PathBuf> {
         if rel_path.is_empty() {
-            // Root directory: prefer cache_dir if it exists, else nas_path
             if self.cache_dir.exists() {
                 return Some(self.cache_dir.clone());
             }
@@ -284,9 +301,40 @@ impl NfsCacheFS {
         if cached.exists() {
             return Some(cached);
         }
+        // If this file's directory is fully cached and it's not in cache, it doesn't exist
+        if self.is_cached(rel_path) {
+            return None;
+        }
         let nas = self.nas_path.join(rel_path);
         if nas.exists() {
             return Some(nas);
+        }
+        None
+    }
+
+    /// Resolve a relative path and return both the path and its metadata in one shot.
+    /// Avoids the double-stat of resolve() + fs::metadata().
+    fn resolve_with_meta(&self, rel_path: &str) -> Option<(PathBuf, std::fs::Metadata)> {
+        if rel_path.is_empty() {
+            if let Ok(m) = fs::metadata(&self.cache_dir) {
+                return Some((self.cache_dir.clone(), m));
+            }
+            if let Ok(m) = fs::metadata(&self.nas_path) {
+                return Some((self.nas_path.clone(), m));
+            }
+            return None;
+        }
+        let cached = self.cache_dir.join(rel_path);
+        if let Ok(m) = fs::metadata(&cached) {
+            return Some((cached, m));
+        }
+        // If this file's directory is fully cached and it's not in cache, it doesn't exist
+        if self.is_cached(rel_path) {
+            return None;
+        }
+        let nas = self.nas_path.join(rel_path);
+        if let Ok(m) = fs::metadata(&nas) {
+            return Some((nas, m));
         }
         None
     }
@@ -349,16 +397,8 @@ impl NfsCacheFS {
             || name.ends_with("~") || name.starts_with(".~") || name.starts_with("~$")
     }
 
-    fn list_dir(&self, rel_path: &str) -> Vec<(String, FileType)> {
-        let mut entries: HashMap<String, FileType> = HashMap::new();
-
-        // Read from NAS
-        let nas_dir = if rel_path.is_empty() {
-            self.nas_path.clone()
-        } else {
-            self.nas_path.join(rel_path)
-        };
-        if let Ok(read_dir) = fs::read_dir(&nas_dir) {
+    fn read_dir_entries(dir: &Path, entries: &mut HashMap<String, FileType>) {
+        if let Ok(read_dir) = fs::read_dir(dir) {
             for entry in read_dir.filter_map(|e| e.ok()) {
                 if let Some(name) = entry.file_name().to_str() {
                     if Self::is_hidden_entry(name) {
@@ -373,32 +413,53 @@ impl NfsCacheFS {
                 }
             }
         }
+    }
 
-        // Read from cache (overrides/merges with NAS)
+    fn list_dir(&self, rel_path: &str) -> Vec<(String, FileType)> {
+        // Check in-memory cache first
+        {
+            let cache = self.dir_list_cache.lock().unwrap();
+            if let Some((when, entries)) = cache.get(rel_path) {
+                if when.elapsed() < DIR_LIST_CACHE_TTL {
+                    return entries.clone();
+                }
+            }
+        }
+
+        let mut entries: HashMap<String, FileType> = HashMap::new();
+        let dir_is_cached = self.is_cached(rel_path);
+
+        // Skip NAS read if this directory is fully cached — serve from cache only
+        if !dir_is_cached {
+            let nas_dir = if rel_path.is_empty() {
+                self.nas_path.clone()
+            } else {
+                self.nas_path.join(rel_path)
+            };
+            Self::read_dir_entries(&nas_dir, &mut entries);
+        }
+
+        // Read from cache (overrides/merges with NAS for uncached dirs)
         let cache_dir = if rel_path.is_empty() {
             self.cache_dir.clone()
         } else {
             self.cache_dir.join(rel_path)
         };
-        if let Ok(read_dir) = fs::read_dir(&cache_dir) {
-            for entry in read_dir.filter_map(|e| e.ok()) {
-                if let Some(name) = entry.file_name().to_str() {
-                    if Self::is_hidden_entry(name) {
-                        continue;
-                    }
-                    let ft = if entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
-                        FileType::Directory
-                    } else {
-                        FileType::RegularFile
-                    };
-                    entries.insert(name.to_string(), ft);
-                }
-            }
-        }
+        Self::read_dir_entries(&cache_dir, &mut entries);
 
         let mut result: Vec<(String, FileType)> = entries.into_iter().collect();
         result.sort_by(|a, b| a.0.cmp(&b.0));
+
+        // Store in cache
+        self.dir_list_cache.lock().unwrap()
+            .insert(rel_path.to_string(), (Instant::now(), result.clone()));
+
         result
+    }
+
+    /// Invalidate the cached directory listing for a given directory.
+    fn invalidate_dir_cache(&self, dir_rel: &str) {
+        self.dir_list_cache.lock().unwrap().remove(dir_rel);
     }
 
     fn alloc_fh(&self) -> u64 {
@@ -418,8 +479,12 @@ impl NfsCacheFS {
     }
 }
 
+/// Threshold for logging slow FUSE operations.
+const SLOW_OP_THRESHOLD: Duration = Duration::from_millis(1);
+
 impl Filesystem for NfsCacheFS {
     fn lookup(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEntry) {
+        let t0 = Instant::now();
         let name_str = match name.to_str() {
             Some(n) => n,
             None => {
@@ -441,17 +506,10 @@ impl Filesystem for NfsCacheFS {
 
         let child_rel = Self::join_rel(&parent_rel, name_str);
 
-        let resolved = match self.resolve(&child_rel) {
-            Some(p) => p,
+        let (_resolved, meta) = match self.resolve_with_meta(&child_rel) {
+            Some(r) => r,
             None => {
-                reply.error(Errno::ENOENT);
-                return;
-            }
-        };
-
-        let meta = match fs::metadata(&resolved) {
-            Ok(m) => m,
-            Err(_) => {
+                debug!("LOOKUP {} → ENOENT ({:.1}ms)", child_rel, t0.elapsed().as_secs_f64() * 1000.0);
                 reply.error(Errno::ENOENT);
                 return;
             }
@@ -459,10 +517,15 @@ impl Filesystem for NfsCacheFS {
 
         let ino = self.inodes.lock().unwrap().get_or_create(&child_rel);
         let attr = self.make_attr(INodeNo(ino), &meta);
+        let elapsed = t0.elapsed();
+        if elapsed > SLOW_OP_THRESHOLD {
+            debug!("LOOKUP {} ({:.1}ms)", child_rel, elapsed.as_secs_f64() * 1000.0);
+        }
         reply.entry(&TTL, &attr, Generation(0));
     }
 
     fn getattr(&self, _req: &Request, ino: INodeNo, _fh: Option<FileHandle>, reply: ReplyAttr) {
+        let t0 = Instant::now();
         let rel_path = {
             let inodes = self.inodes.lock().unwrap();
             match inodes.get_path(ino.0) {
@@ -510,20 +573,16 @@ impl Filesystem for NfsCacheFS {
             return;
         }
 
-        let resolved = match self.resolve(&rel_path) {
-            Some(p) => p,
-            None => {
-                reply.error(Errno::ENOENT);
-                return;
-            }
-        };
-
-        match fs::metadata(&resolved) {
-            Ok(m) => {
+        match self.resolve_with_meta(&rel_path) {
+            Some((_path, m)) => {
                 let attr = self.make_attr(ino, &m);
+                let elapsed = t0.elapsed();
+                if elapsed > SLOW_OP_THRESHOLD {
+                    debug!("GETATTR {} ({:.1}ms)", rel_path, elapsed.as_secs_f64() * 1000.0);
+                }
                 reply.attr(&TTL, &attr);
             }
-            Err(_) => reply.error(Errno::ENOENT),
+            None => reply.error(Errno::ENOENT),
         }
     }
 
@@ -535,6 +594,7 @@ impl Filesystem for NfsCacheFS {
         offset: u64,
         mut reply: ReplyDirectory,
     ) {
+        let t0 = Instant::now();
         let rel_path = {
             let inodes = self.inodes.lock().unwrap();
             match inodes.get_path(ino.0) {
@@ -579,16 +639,25 @@ impl Filesystem for NfsCacheFS {
             }
         }
 
+        let n_children = entries.len().saturating_sub(2); // exclude . and ..
         for (i, (ino, ft, name)) in entries.iter().enumerate().skip(offset as usize) {
             // reply.add returns true when buffer is full
             if reply.add(INodeNo(*ino), (i + 1) as u64, *ft, &name) {
                 break;
             }
         }
+        let elapsed = t0.elapsed();
+        if elapsed > SLOW_OP_THRESHOLD {
+            let cached = self.is_cached(&rel_path);
+            debug!("READDIR {} ({} entries, cached={}, {:.1}ms)",
+                if rel_path.is_empty() { "/" } else { &rel_path },
+                n_children, cached, elapsed.as_secs_f64() * 1000.0);
+        }
         reply.ok();
     }
 
     fn open(&self, _req: &Request, ino: INodeNo, flags: OpenFlags, reply: ReplyOpen) {
+        let t0 = Instant::now();
         let rel_path = {
             let inodes = self.inodes.lock().unwrap();
             match inodes.get_path(ino.0) {
@@ -600,10 +669,42 @@ impl Filesystem for NfsCacheFS {
             }
         };
 
-        // Trigger background caching of this file's directory
-        self.trigger_dir_cache(&rel_path);
-
         let is_write = flags.0 & libc::O_WRONLY != 0 || flags.0 & libc::O_RDWR != 0;
+        let cached = self.is_cached(&rel_path);
+
+        // Fast path: file is in a cached directory — open directly from cache,
+        // no resolve, no trigger_dir_cache, no NAS I/O
+        if cached {
+            let cache_path = self.cache_dir.join(&rel_path);
+            let file = match OpenOptions::new()
+                .read(true)
+                .write(is_write)
+                .open(&cache_path)
+            {
+                Ok(f) => f,
+                Err(e) => {
+                    error!("Failed to open cached {:?}: {}", cache_path, e);
+                    reply.error(Errno::EIO);
+                    return;
+                }
+            };
+
+            let fh = self.alloc_fh();
+            self.file_handles
+                .lock()
+                .unwrap()
+                .insert(fh, OpenFileHandle { file, is_cached: true, dirty: false });
+
+            let elapsed = t0.elapsed();
+            if elapsed > SLOW_OP_THRESHOLD {
+                debug!("OPEN {} (cached, {:.1}ms)", rel_path, elapsed.as_secs_f64() * 1000.0);
+            }
+            reply.opened(FileHandle(fh), FopenFlags::empty());
+            return;
+        }
+
+        // Slow path: not cached — resolve from NAS, trigger background caching
+        self.trigger_dir_cache(&rel_path);
 
         let resolved = match self.resolve(&rel_path) {
             Some(p) => p,
@@ -613,8 +714,7 @@ impl Filesystem for NfsCacheFS {
             }
         };
 
-        // If writing and file is on NAS (not cached), copy to cache first
-        // so writes go to local disk and get flushed to NAS later
+        // If writing and file is on NAS, copy to cache first
         let (open_path, is_cached) = if is_write && !resolved.starts_with(&self.cache_dir) {
             let cache_path = self.cache_dir.join(&rel_path);
             if let Some(parent) = cache_path.parent() {
@@ -622,7 +722,6 @@ impl Filesystem for NfsCacheFS {
             }
             if fs::copy(&resolved, &cache_path).is_ok() {
                 info!("Copied to cache for write: {}", rel_path);
-                // Mark as pending NAS write
                 self.pending_writes.lock().unwrap().insert(rel_path.clone());
                 if let Some(ref db) = self.db {
                     let db = db.lock().unwrap();
@@ -630,7 +729,6 @@ impl Filesystem for NfsCacheFS {
                 }
                 (cache_path, true)
             } else {
-                // Fallback: write directly to NAS
                 warn!("Failed to copy to cache for write, using NAS directly: {}", rel_path);
                 (resolved, false)
             }
@@ -658,13 +756,18 @@ impl Filesystem for NfsCacheFS {
             .unwrap()
             .insert(fh, OpenFileHandle { file, is_cached, dirty: false });
 
+        let elapsed = t0.elapsed();
+        let source = if is_cached { "cache" } else { "NAS" };
+        if elapsed > SLOW_OP_THRESHOLD {
+            debug!("OPEN {} ({}, {:.1}ms)", rel_path, source, elapsed.as_secs_f64() * 1000.0);
+        }
         reply.opened(FileHandle(fh), FopenFlags::empty());
     }
 
     fn read(
         &self,
         _req: &Request,
-        _ino: INodeNo,
+        ino: INodeNo,
         fh: FileHandle,
         offset: u64,
         size: u32,
@@ -672,27 +775,44 @@ impl Filesystem for NfsCacheFS {
         _lock_owner: Option<LockOwner>,
         reply: ReplyData,
     ) {
-        let mut handles = self.file_handles.lock().unwrap();
-        let handle = match handles.get_mut(&fh.0) {
-            Some(h) => h,
-            None => {
+        let t0 = Instant::now();
+        // Lock only long enough to clone the file handle, then release
+        let file_result = {
+            let handles = self.file_handles.lock().unwrap();
+            match handles.get(&fh.0) {
+                Some(h) => {
+                    // Use pread to avoid needing &mut and allow concurrent reads
+                    let fd = std::os::unix::io::AsRawFd::as_raw_fd(&h.file);
+                    Ok(fd)
+                }
+                None => Err(()),
+            }
+        };
+
+        let fd = match file_result {
+            Ok(fd) => fd,
+            Err(()) => {
                 reply.error(Errno::ENOENT);
                 return;
             }
         };
 
+        // Read without holding the file_handles lock
         let mut buf = vec![0u8; size as usize];
-        if let Err(e) = handle.file.seek(SeekFrom::Start(offset)) {
-            error!("seek error: {}", e);
+        let n = unsafe {
+            libc::pread(fd, buf.as_mut_ptr() as *mut libc::c_void, size as usize, offset as i64)
+        };
+        if n < 0 {
+            error!("pread error: {}", std::io::Error::last_os_error());
             reply.error(Errno::EIO);
-            return;
-        }
-        match handle.file.read(&mut buf) {
-            Ok(n) => reply.data(&buf[..n]),
-            Err(e) => {
-                error!("read error: {}", e);
-                reply.error(Errno::EIO);
+        } else {
+            let elapsed = t0.elapsed();
+            if elapsed > Duration::from_millis(10) {
+                let rel_path = self.inodes.lock().unwrap().get_path(ino.0).map(|p| p.to_string());
+                debug!("READ {} offset={} size={} ({:.1}ms)",
+                    rel_path.as_deref().unwrap_or("?"), offset, n, elapsed.as_secs_f64() * 1000.0);
             }
+            reply.data(&buf[..n as usize]);
         }
     }
 
@@ -709,37 +829,38 @@ impl Filesystem for NfsCacheFS {
         let handle = self.file_handles.lock().unwrap().remove(&fh.0);
         let was_dirty = handle.map(|h| h.dirty && h.is_cached).unwrap_or(false);
 
-        // Update cache DB with final file state
+        // Fast path: file was only read, not modified — just close, no DB/stat work
+        if !was_dirty {
+            reply.ok();
+            return;
+        }
+
+        // Slow path: file was modified — update DB and queue for NAS sync
         let rel_path = {
             let inodes = self.inodes.lock().unwrap();
             inodes.get_path(ino.0).map(|p| p.to_string())
         };
         if let Some(rel) = rel_path {
             let cache_path = self.cache_dir.join(&rel);
-            if cache_path.exists() {
-                if let Ok(meta) = fs::metadata(&cache_path) {
-                    let mtime = meta.modified()
-                        .unwrap_or(UNIX_EPOCH)
-                        .duration_since(UNIX_EPOCH)
-                        .unwrap_or_default()
-                        .as_secs_f64();
-                    self.db_add(&rel, meta.len(), mtime);
-                }
+            if let Ok(meta) = fs::metadata(&cache_path) {
+                let mtime = meta.modified()
+                    .unwrap_or(UNIX_EPOCH)
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs_f64();
+                self.db_add(&rel, meta.len(), mtime);
+            }
 
-                // If file was modified, queue for NAS sync (skip temp files)
-                if was_dirty {
-                    let file_name = std::path::Path::new(&rel)
-                        .file_name()
-                        .and_then(|n| n.to_str())
-                        .unwrap_or("");
-                    if !Self::is_temp_file(file_name) {
-                        info!("File modified, queuing for NAS sync: {}", rel);
-                        self.pending_writes.lock().unwrap().insert(rel.clone());
-                        if let Some(ref db) = self.db {
-                            let db = db.lock().unwrap();
-                            db.add_pending_write(&rel).ok();
-                        }
-                    }
+            let file_name = std::path::Path::new(&rel)
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("");
+            if !Self::is_temp_file(file_name) {
+                info!("File modified, queuing for NAS sync: {}", rel);
+                self.pending_writes.lock().unwrap().insert(rel.clone());
+                if let Some(ref db) = self.db {
+                    let db = db.lock().unwrap();
+                    db.add_pending_write(&rel).ok();
                 }
             }
         }
@@ -842,6 +963,7 @@ impl Filesystem for NfsCacheFS {
             .unwrap()
             .insert(fh, OpenFileHandle { file, is_cached: true, dirty: false });
 
+        self.invalidate_dir_cache(&parent_rel);
         reply.created(&TTL, &attr, Generation(0), FileHandle(fh), FopenFlags::empty());
     }
 
@@ -945,6 +1067,7 @@ impl Filesystem for NfsCacheFS {
 
         let ino = self.inodes.lock().unwrap().get_or_create(&child_rel);
         let attr = self.make_attr(INodeNo(ino), &meta);
+        self.invalidate_dir_cache(&parent_rel);
         reply.entry(&TTL, &attr, Generation(0));
     }
 
@@ -998,6 +1121,7 @@ impl Filesystem for NfsCacheFS {
         }
         info!("  DB: removed");
         self.inodes.lock().unwrap().remove_path(&child_rel);
+        self.invalidate_dir_cache(&parent_rel);
         reply.ok();
     }
 
@@ -1058,6 +1182,8 @@ impl Filesystem for NfsCacheFS {
         }
 
         self.inodes.lock().unwrap().remove_path(&child_rel);
+        self.invalidate_dir_cache(&parent_rel);
+        self.invalidate_dir_cache(&child_rel);
         reply.ok();
     }
 
@@ -1175,6 +1301,10 @@ impl Filesystem for NfsCacheFS {
 
         info!("  DB: updated");
         self.inodes.lock().unwrap().rename(&old_rel, &new_rel);
+        self.invalidate_dir_cache(&parent_rel);
+        if newparent_rel != parent_rel {
+            self.invalidate_dir_cache(&newparent_rel);
+        }
         reply.ok();
     }
 
@@ -1262,9 +1392,14 @@ impl Filesystem for NfsCacheFS {
         let name_str = name.to_str().unwrap_or("");
 
         // Determine color: Orange = pending write, Green = cached (dir or file)
+        // is_cached checks both the dir itself and its parent dir in cached_dirs set (no I/O).
+        // is_file_cached does a stat syscall — only use it as a fallback for files whose
+        // parent dir isn't fully cached (e.g. individually cached via write-back).
         let color = if self.is_pending_write(&rel_path) {
             Some(FINDER_COLOR_ORANGE)
-        } else if self.is_cached(&rel_path) || self.is_file_cached(&rel_path) {
+        } else if self.is_cached(&rel_path) {
+            Some(FINDER_COLOR_GREEN)
+        } else if self.is_file_cached(&rel_path) {
             Some(FINDER_COLOR_GREEN)
         } else {
             None
@@ -1299,7 +1434,7 @@ impl Filesystem for NfsCacheFS {
             }
         };
 
-        if self.is_pending_write(&rel_path) || self.is_cached(&rel_path) || self.is_file_cached(&rel_path) {
+        if self.is_pending_write(&rel_path) || self.is_cached(&rel_path) || self.is_file_cached(&rel_path)  {
             // Only report FinderInfo xattr
             let mut names = Vec::from(FINDER_INFO_XATTR.as_bytes());
             names.push(0);
