@@ -307,7 +307,9 @@ pub fn cleanup_stale_state(nas_path: &Path, cache_dir: &Path, db: &CacheDB) {
                 debug!("Preserving untracked directory with pending writes: {}", dir_name);
                 continue;
             }
-            if !db.is_dir_cached(&dir_name).unwrap_or(true) {
+            let is_tracked = db.is_dir_cached(&dir_name).unwrap_or(true)
+                || db.has_cached_children(&dir_name).unwrap_or(true);
+            if !is_tracked {
                 info!("Cleaning up untracked directory: {}", dir_name);
                 let _ = fs::remove_dir_all(entry.path());
                 let _ = db.remove_dir(&dir_name);

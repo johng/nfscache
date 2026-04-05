@@ -200,6 +200,18 @@ impl CacheDB {
         )?;
         Ok(count > 0)
     }
+
+    /// Check if any cached directory lives under this top-level path.
+    /// e.g., has_cached_children("2026") returns true if "2026/Scotland" is cached.
+    pub fn has_cached_children(&self, prefix: &str) -> rusqlite::Result<bool> {
+        let pattern = format!("{}/", prefix);
+        let count: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM directories WHERE dir_path LIKE ?1 || '%'",
+            params![pattern],
+            |row| row.get(0),
+        )?;
+        Ok(count > 0)
+    }
 }
 
 #[cfg(test)]
