@@ -1,6 +1,7 @@
 mod cache_db;
 mod config;
 mod fs;
+mod nas;
 mod sync;
 
 use clap::{Parser, Subcommand};
@@ -72,13 +73,15 @@ fn cmd_mount(config: &Config, cp: &std::path::Path) {
         eprintln!();
     }
 
-    // Validate NAS path
+    // Warn (don't exit) if the NAS isn't reachable yet. Mounting anyway lets us
+    // serve cached content during a network/VPN outage, and the NAS is picked up
+    // automatically once it returns. Exiting here would crash-loop under launchd
+    // KeepAlive whenever the service starts before the VPN is up.
     if !config.nas_photos_path.exists() {
-        eprintln!("Error: NAS path not found: {}", config.nas_photos_path.display());
-        eprintln!("Mount your NAS first:");
-        eprintln!("  sudo mount -t nfs -o vers=3,nolock,resvport <NAS_IP>:<SHARE> <MOUNT_POINT>");
-        eprintln!("Then update nas_photos_path in {}", cp.display());
-        std::process::exit(1);
+        eprintln!("Warning: NAS path not reachable: {}", config.nas_photos_path.display());
+        eprintln!("Mounting in cache-only mode. Cached photos stay browsable; the NAS is");
+        eprintln!("picked up automatically once it's reachable. To (re)mount the NAS:");
+        eprintln!("  sudo mount -t nfs -o vers=3,nolock,resvport,soft,timeo=30,retrans=2 <NAS_IP>:<SHARE> <MOUNT_POINT>");
     }
 
     // Validate cache size

@@ -18,7 +18,7 @@
     <key>EnvironmentVariables</key>
     <dict>
         <key>RUST_LOG</key>
-        <string>nfscache::sync=info,nfscache::fs=debug</string>
+        <string>nfscache::sync=info,nfscache::nas=info,nfscache::fs=debug</string>
     </dict>
     <key>StandardOutPath</key>
     <string>/Users/johng/Library/Logs/nfscache/mount.log</string>

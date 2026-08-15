@@ -38,13 +38,21 @@ Open `~/NAS Pictures` in Finder. Directories cache automatically as you browse.
 | Target | Description |
 |--------|-------------|
 | `make install` | Build, install to `/usr/local/bin`, init config |
+| `make redeploy` | Rebuild, install, ensure NAS mounted (soft), restart service |
 | `make upgrade` | Rebuild and replace binary, restart service |
 | `make uninstall` | Stop service, remove binary |
 | `make service-start` | Start as a background launchd service |
 | `make service-stop` | Stop the background service |
 | `make service-restart` | Restart the service |
+| `make remount` | Mount the NAS with resilient options if not already mounted |
+| `make force-remount` | Force a clean remount to recover a hung/stale NAS mount |
 | `make test` | Run tests |
 | `make clean` | Remove build artifacts |
+
+The NAS mount settings (`NAS_HOST`, `NAS_SHARE`, `NAS_MOUNT`, `NFS_OPTS`) are
+overridable Make variables — e.g. `make remount NAS_HOST=192.168.50.22`. The
+default `NFS_OPTS` use `soft,timeo=30,retrans=2` so a VPN/network drop returns an
+error instead of hanging Finder.
 
 ## Commands
 

@@ -6,6 +6,7 @@ use fuser::{
     RenameFlags, Request, TimeOrNow, WriteFlags,
 };
 use crate::cache_db::CacheDB;
+use crate::nas::NasHealth;
 use crate::sync::CacheWorker;
 use crate::sync::WriteFlushWorker;
 use log::{debug, error, info, warn};
@@ -20,6 +21,10 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const TTL: Duration = Duration::from_secs(30);
 const DIR_LIST_CACHE_TTL: Duration = Duration::from_secs(30);
+/// Max time a single FUSE-thread NAS call may block before the breaker trips.
+const NAS_OP_TIMEOUT: Duration = Duration::from_secs(3);
+/// How often the background health thread re-checks NAS reachability.
+const NAS_PROBE_INTERVAL: Duration = Duration::from_secs(5);
 const ROOT_INO: u64 = 1;
 const FINDER_INFO_XATTR: &str = "com.apple.FinderInfo";
 const FINDER_INFO_LEN: usize = 32;
@@ -33,6 +38,20 @@ fn make_finder_info(color_byte: u8) -> [u8; FINDER_INFO_LEN] {
     let mut info = [0u8; FINDER_INFO_LEN];
     info[9] = color_byte;
     info
+}
+
+/// Read a directory's entries as (name, is_dir) pairs. Runs on a NAS-I/O worker
+/// thread (via NasHealth::run) so a hung mount can't block the FUSE thread.
+fn read_dir_names(dir: &Path) -> std::io::Result<Vec<(String, bool)>> {
+    let mut out = Vec::new();
+    for entry in fs::read_dir(dir)? {
+        let entry = entry?;
+        if let Some(name) = entry.file_name().to_str() {
+            let is_dir = entry.file_type().map(|t| t.is_dir()).unwrap_or(false);
+            out.push((name.to_string(), is_dir));
+        }
+    }
+    Ok(out)
 }
 
 struct InodeMap {
@@ -110,6 +129,8 @@ pub struct NfsCacheFS {
     pending_writes: Mutex<HashSet<String>>,
     /// Cached directory listings to avoid repeated NAS readdir calls.
     dir_list_cache: Mutex<HashMap<String, (Instant, Vec<(String, FileType)>)>>,
+    /// Circuit breaker so FUSE callbacks never block on a hung NAS mount.
+    nas: NasHealth,
     uid: u32,
     gid: u32,
 }
@@ -124,6 +145,8 @@ impl NfsCacheFS {
     ) -> Self {
         let uid = unsafe { libc::getuid() };
         let gid = unsafe { libc::getgid() };
+
+        let nas = NasHealth::spawn(nas_path.clone(), NAS_OP_TIMEOUT, NAS_PROBE_INTERVAL);
 
         // Pre-load cached directory names and pending writes from DB
         let mut initial_dirs = HashSet::new();
@@ -155,6 +178,7 @@ impl NfsCacheFS {
             pending_writes: Mutex::new(initial_pending),
             dir_list_cache: Mutex::new(HashMap::new()),
             last_dir_touch: Mutex::new(HashMap::new()),
+            nas,
             uid,
             gid,
         }
@@ -292,7 +316,7 @@ impl NfsCacheFS {
             if self.cache_dir.exists() {
                 return Some(self.cache_dir.clone());
             }
-            if self.nas_path.exists() {
+            if self.nas.exists(&self.nas_path) {
                 return Some(self.nas_path.clone());
             }
             return None;
@@ -305,8 +329,9 @@ impl NfsCacheFS {
         if self.is_cached(rel_path) {
             return None;
         }
+        // NAS access is bounded by the breaker — returns None fast if NAS is down.
         let nas = self.nas_path.join(rel_path);
-        if nas.exists() {
+        if self.nas.exists(&nas) {
             return Some(nas);
         }
         None
@@ -319,7 +344,7 @@ impl NfsCacheFS {
             if let Ok(m) = fs::metadata(&self.cache_dir) {
                 return Some((self.cache_dir.clone(), m));
             }
-            if let Ok(m) = fs::metadata(&self.nas_path) {
+            if let Some(m) = self.nas.metadata(&self.nas_path) {
                 return Some((self.nas_path.clone(), m));
             }
             return None;
@@ -332,8 +357,9 @@ impl NfsCacheFS {
         if self.is_cached(rel_path) {
             return None;
         }
+        // NAS access is bounded by the breaker — returns None fast if NAS is down.
         let nas = self.nas_path.join(rel_path);
-        if let Ok(m) = fs::metadata(&nas) {
+        if let Some(m) = self.nas.metadata(&nas) {
             return Some((nas, m));
         }
         None
@@ -415,6 +441,22 @@ impl NfsCacheFS {
         }
     }
 
+    /// Read NAS directory entries through the breaker so a hung mount can't
+    /// block the FUSE thread. Merges into `entries`; a down/slow NAS is a no-op.
+    fn read_nas_dir_entries(&self, dir: &Path, entries: &mut HashMap<String, FileType>) {
+        let dir = dir.to_path_buf();
+        let names = self.nas.run(move || read_dir_names(&dir));
+        if let Some(names) = names {
+            for (name, is_dir) in names {
+                if Self::is_hidden_entry(&name) {
+                    continue;
+                }
+                let ft = if is_dir { FileType::Directory } else { FileType::RegularFile };
+                entries.insert(name, ft);
+            }
+        }
+    }
+
     fn list_dir(&self, rel_path: &str) -> Vec<(String, FileType)> {
         // Check in-memory cache first
         {
@@ -436,7 +478,7 @@ impl NfsCacheFS {
             } else {
                 self.nas_path.join(rel_path)
             };
-            Self::read_dir_entries(&nas_dir, &mut entries);
+            self.read_nas_dir_entries(&nas_dir, &mut entries);
         }
 
         // Read from cache (overrides/merges with NAS for uncached dirs)
@@ -539,15 +581,16 @@ impl Filesystem for NfsCacheFS {
 
         // For the root directory, we need to synthesize attrs if neither path exists
         if rel_path.is_empty() {
-            // Try cache_dir first, then nas_path
+            // Try cache_dir first (local, fast), then NAS via the breaker.
             let meta = fs::metadata(&self.cache_dir)
-                .or_else(|_| fs::metadata(&self.nas_path));
+                .ok()
+                .or_else(|| self.nas.metadata(&self.nas_path));
             match meta {
-                Ok(m) => {
+                Some(m) => {
                     let attr = self.make_attr(ino, &m);
                     reply.attr(&TTL, &attr);
                 }
-                Err(_) => {
+                None => {
                     // Synthesize a minimal root attr
                     let now = SystemTime::now();
                     let attr = FileAttr {
@@ -1462,15 +1505,16 @@ impl Filesystem for NfsCacheFS {
     }
 
     fn statfs(&self, _req: &Request, _ino: INodeNo, reply: ReplyStatfs) {
+        // Use local cache dir for statfs — never block on NAS.
+        // Lightroom calls this frequently to check disk space.
         let stv = unsafe {
             let mut buf: libc::statfs = std::mem::zeroed();
             let c_path = std::ffi::CString::new(
-                self.nas_path.as_os_str().as_encoded_bytes()
+                self.cache_dir.as_os_str().as_encoded_bytes()
             ).unwrap_or_default();
             if libc::statfs(c_path.as_ptr(), &mut buf) == 0 {
                 buf
             } else {
-                // Fallback if NAS unavailable
                 reply.statfs(0, 0, 0, 0, 0, 4096, 255, 4096);
                 return;
             }
