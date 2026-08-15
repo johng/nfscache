@@ -269,6 +269,24 @@ pub fn evict_lru(
 /// 0. Remove leftover .tmp files from interrupted safe_copy operations
 /// 1. Directories on disk without a DB entry (interrupted cache)
 /// 2. DB entries whose files don't exist on disk (stale from old runs)
+/// True only when the NAS *positively confirms* a directory is gone: its parent
+/// lists successfully and the directory itself reports ENOENT. Any timeout / IO
+/// error (soft mount on an unreachable NAS) returns false, so a network blip is
+/// never mistaken for a deletion. Used to gate destructive cache invalidation.
+fn nas_dir_confirmed_gone(nas_dir: &Path) -> bool {
+    match fs::metadata(nas_dir) {
+        Ok(_) => false, // still present
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {
+            // Only trust ENOENT if the NAS is actually serving the parent dir.
+            match nas_dir.parent() {
+                Some(parent) => fs::read_dir(parent).is_ok(),
+                None => false,
+            }
+        }
+        Err(_) => false, // timeout / IO error → assume present, do not purge
+    }
+}
+
 pub fn cleanup_stale_state(nas_path: &Path, cache_dir: &Path, db: &CacheDB) {
     if !cache_dir.is_dir() {
         return;
@@ -330,30 +348,67 @@ pub fn cleanup_stale_state(nas_path: &Path, cache_dir: &Path, db: &CacheDB) {
         info!("Removed {} stale DB entries (files missing from disk)", removed);
     }
 
-    // 3. Remove cached files that no longer exist on NAS (skip pending writes)
+    // 3. Remove cached files that no longer exist on NAS (skip pending writes).
+    //
+    //    SAFETY: only purge when the NAS *positively* reports the file gone
+    //    (ENOENT) AND its parent directory is currently listable. A soft NFS
+    //    mount returns timeouts/IO errors (not ENOENT) when the NAS is
+    //    unreachable, and `Path::exists()` collapses "timed out" into `false` —
+    //    so the old code treated a network blip as mass deletion and destroyed
+    //    the cache. Here, any uncertainty means we keep the cached copy.
     if nas_path.is_dir() {
         let cached_paths = db.all_cached_paths().unwrap_or_default();
         let pending = db.all_pending_writes().unwrap_or_default();
         let pending_set: std::collections::HashSet<&str> = pending.iter().map(|s| s.as_str()).collect();
         let mut nas_removed = 0u32;
+        let mut kept_uncertain = 0u32;
+        // Memoize NAS parent-directory reachability to avoid re-listing per file.
+        let mut parent_listable: HashMap<PathBuf, bool> = HashMap::new();
         for path in &cached_paths {
             // Don't remove files that are pending NAS write — they're supposed to be local-only
             if pending_set.contains(path.as_str()) {
                 debug!("Skipping pending write during cleanup: {}", path);
                 continue;
             }
-            if !nas_path.join(path).exists() {
-                info!("File deleted from NAS, removing from cache: {}", path);
-                let cache_file = cache_dir.join(path);
-                if cache_file.exists() {
-                    let _ = fs::remove_file(&cache_file);
+            let nas_file = nas_path.join(path);
+            match fs::metadata(&nas_file) {
+                Ok(_) => {} // still present on NAS
+                Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                    // ENOENT is only trustworthy if the NAS is actually serving
+                    // this subtree; confirm the parent dir lists before purging.
+                    let listable = match nas_file.parent() {
+                        Some(parent) => *parent_listable
+                            .entry(parent.to_path_buf())
+                            .or_insert_with(|| fs::read_dir(parent).is_ok()),
+                        None => false,
+                    };
+                    if listable {
+                        info!("File deleted from NAS, removing from cache: {}", path);
+                        let cache_file = cache_dir.join(path);
+                        if cache_file.exists() {
+                            let _ = fs::remove_file(&cache_file);
+                        }
+                        let _ = db.remove(path);
+                        nas_removed += 1;
+                    } else {
+                        kept_uncertain += 1;
+                    }
                 }
-                let _ = db.remove(path);
-                nas_removed += 1;
+                Err(_) => {
+                    // Timeout / IO error: NAS is unreliable right now. Keep the
+                    // cached copy rather than risk purging live data.
+                    kept_uncertain += 1;
+                }
             }
         }
         if nas_removed > 0 {
-            info!("Removed {} cached files deleted from NAS", nas_removed);
+            info!("Removed {} cached files confirmed deleted from NAS", nas_removed);
+        }
+        if kept_uncertain > 0 {
+            warn!(
+                "Kept {} cached files whose NAS status was unreachable/uncertain — not purging during NAS flakiness",
+                kept_uncertain
+            );
         }
     }
 
@@ -580,13 +635,17 @@ impl WriteFlushWorker {
                     evict_lru(&cache_dir, &db_guard, max_cache_bytes, None);
                 }
 
-                // Every ~60 seconds, verify cached directories still exist on NAS
+                // Every ~60 seconds, verify cached directories still exist on NAS.
+                // SAFETY: only invalidate on a *confirmed* removal — the NAS
+                // parent must be listable and report ENOENT for this dir. A soft
+                // NFS mount returns timeouts when unreachable; treating those as
+                // removals would wipe live cached directories during a blip.
                 if cycle_count % 12 == 0 {
                     let db_guard = db.lock().unwrap();
                     if let Ok(dirs) = db_guard.lru_directories() {
                         for dir in &dirs {
                             let nas_dir = nas_path.join(&dir.dir_path);
-                            if !nas_dir.exists() {
+                            if nas_dir_confirmed_gone(&nas_dir) {
                                 info!("Directory removed from NAS, invalidating cache: {}", dir.dir_path);
                                 let cache_path = cache_dir.join(&dir.dir_path);
                                 if cache_path.is_dir() {
@@ -815,6 +874,51 @@ mod tests {
             "pending write should be preserved in DB");
         assert!(cache.path().join("March 2026/pending.jpg").exists(),
             "pending write should be preserved on disk");
+    }
+
+    #[test]
+    fn test_nas_dir_confirmed_gone() {
+        let nas = TempDir::new().unwrap();
+        // Present directory → not gone.
+        let present = nas.path().join("2026/April");
+        fs::create_dir_all(&present).unwrap();
+        assert!(!nas_dir_confirmed_gone(&present));
+        // Genuinely removed, parent (2026) still lists → confirmed gone.
+        let removed = nas.path().join("2026/Deleted");
+        assert!(nas_dir_confirmed_gone(&removed));
+        // Whole subtree unreachable (parent dir absent → stand-in for a timeout)
+        // → NOT confirmed gone, cache must be kept.
+        let unreachable = nas.path().join("NoSuchParent/Turkey");
+        assert!(!nas_dir_confirmed_gone(&unreachable));
+    }
+
+    #[test]
+    fn test_cleanup_keeps_cache_when_nas_subtree_unreachable() {
+        // Regression: a flaky/soft NFS mount makes NAS reads fail (parent dir not
+        // listable). Cleanup must NOT treat that as "deleted from NAS" and purge
+        // the cache — otherwise a network blip destroys cached data.
+        let nas = TempDir::new().unwrap();
+        let cache = TempDir::new().unwrap();
+        let db = CacheDB::open(Path::new(":memory:")).unwrap();
+
+        // Cached file present on disk + DB...
+        let dir = cache.path().join("2025/Turkey");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("R0000254.DNG"), b"data").unwrap();
+        db.add("2025/Turkey/R0000254.DNG", 100, 1.0, None).unwrap();
+        db.touch_dir("2025/Turkey", 100).unwrap();
+
+        // ...but the NAS root exists while the file's subtree (2025/Turkey) is
+        // NOT present — i.e. the parent dir does not list (stand-in for a timeout).
+        // NAS root must be a dir so step 3 runs at all.
+        assert!(nas.path().is_dir());
+
+        cleanup_stale_state(nas.path(), cache.path(), &db);
+
+        assert!(db.get("2025/Turkey/R0000254.DNG").unwrap().is_some(),
+            "cache DB entry must be kept when NAS subtree is unreachable");
+        assert!(cache.path().join("2025/Turkey/R0000254.DNG").exists(),
+            "cached file must be kept when NAS subtree is unreachable");
     }
 
     #[test]
