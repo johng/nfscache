@@ -49,6 +49,13 @@ impl CacheDB {
             CREATE TABLE IF NOT EXISTS pending_writes (
                 path TEXT PRIMARY KEY,
                 created_at REAL NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS dir_tree (
+                parent  TEXT NOT NULL,
+                name    TEXT NOT NULL,
+                is_dir  INTEGER NOT NULL,
+                seen_at REAL NOT NULL,
+                PRIMARY KEY (parent, name)
             );"
         )?;
         // Migration: add checksum column to existing databases
@@ -211,6 +218,56 @@ impl CacheDB {
             |row| row.get(0),
         )?;
         Ok(count > 0)
+    }
+
+    // --- Directory tree metadata (structure cache) ---
+    //
+    // A persistent snapshot of the NAS directory *structure* — one row per entry
+    // (parent dir + name + is_dir). Recorded whenever we successfully list a
+    // directory on the NAS, so that during a NAS outage we can still serve a
+    // *complete* listing of any previously-seen directory rather than a
+    // truncated (or empty) one. Only structure is stored; file bytes are still
+    // fetched on demand.
+
+    /// Replace the persisted listing for `parent` with exactly `entries`.
+    /// Transactional so a reader never sees a half-updated directory.
+    pub fn replace_dir_listing(&self, parent: &str, entries: &[(String, bool)]) -> rusqlite::Result<()> {
+        let tx = self.conn.unchecked_transaction()?;
+        tx.execute("DELETE FROM dir_tree WHERE parent = ?1", params![parent])?;
+        {
+            let now = now_secs();
+            let mut stmt = tx.prepare(
+                "INSERT OR REPLACE INTO dir_tree (parent, name, is_dir, seen_at) VALUES (?1, ?2, ?3, ?4)"
+            )?;
+            for (name, is_dir) in entries {
+                stmt.execute(params![parent, name, *is_dir as i64, now])?;
+            }
+        }
+        tx.commit()
+    }
+
+    /// Load the persisted listing for `parent` as (name, is_dir) pairs.
+    pub fn get_dir_listing(&self, parent: &str) -> rusqlite::Result<Vec<(String, bool)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT name, is_dir FROM dir_tree WHERE parent = ?1 ORDER BY name ASC"
+        )?;
+        let rows = stmt.query_map(params![parent], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)? != 0))
+        })?;
+        rows.collect()
+    }
+
+    /// Look up a single persisted tree entry. Returns `Some(is_dir)` if known.
+    pub fn get_tree_entry(&self, parent: &str, name: &str) -> rusqlite::Result<Option<bool>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT is_dir FROM dir_tree WHERE parent = ?1 AND name = ?2"
+        )?;
+        let mut rows = stmt.query_map(params![parent, name], |row| Ok(row.get::<_, i64>(0)? != 0))?;
+        match rows.next() {
+            Some(Ok(v)) => Ok(Some(v)),
+            Some(Err(e)) => Err(e),
+            None => Ok(None),
+        }
     }
 }
 
@@ -388,6 +445,44 @@ mod tests {
 
         let pending = db.all_pending_writes().unwrap();
         assert_eq!(pending, vec!["first.jpg", "second.jpg", "third.jpg"]);
+    }
+
+    #[test]
+    fn test_dir_tree_replace_and_get() {
+        let db = test_db();
+        db.replace_dir_listing("2025", &[
+            ("August".to_string(), true),
+            ("photo.jpg".to_string(), false),
+        ]).unwrap();
+
+        let mut listing = db.get_dir_listing("2025").unwrap();
+        listing.sort();
+        assert_eq!(listing, vec![
+            ("August".to_string(), true),
+            ("photo.jpg".to_string(), false),
+        ]);
+
+        assert_eq!(db.get_tree_entry("2025", "August").unwrap(), Some(true));
+        assert_eq!(db.get_tree_entry("2025", "photo.jpg").unwrap(), Some(false));
+        assert_eq!(db.get_tree_entry("2025", "missing").unwrap(), None);
+    }
+
+    #[test]
+    fn test_dir_tree_replace_is_atomic_swap() {
+        let db = test_db();
+        db.replace_dir_listing("d", &[("a".to_string(), false), ("b".to_string(), false)]).unwrap();
+        // Re-listing with a different set fully replaces the old one (no stragglers).
+        db.replace_dir_listing("d", &[("b".to_string(), false), ("c".to_string(), true)]).unwrap();
+        let mut listing = db.get_dir_listing("d").unwrap();
+        listing.sort();
+        assert_eq!(listing, vec![("b".to_string(), false), ("c".to_string(), true)]);
+        assert_eq!(db.get_tree_entry("d", "a").unwrap(), None);
+    }
+
+    #[test]
+    fn test_dir_tree_empty_for_unknown_parent() {
+        let db = test_db();
+        assert!(db.get_dir_listing("never/seen").unwrap().is_empty());
     }
 
     #[test]

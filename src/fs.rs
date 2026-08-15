@@ -17,6 +17,7 @@ use std::io::{Seek, SeekFrom, Write};
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
+use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const TTL: Duration = Duration::from_secs(30);
@@ -110,6 +111,30 @@ struct OpenFileHandle {
     dirty: bool,
 }
 
+/// Result of listing a directory.
+enum DirListing {
+    /// A complete, trustworthy listing. Sourced from a fully-cached directory, a
+    /// successful live NAS read, or — during a NAS outage — the persisted tree
+    /// metadata for a previously-seen directory.
+    Complete(Vec<(String, FileType)>),
+    /// The directory's contents are currently unknowable: the NAS is unreachable
+    /// and we have neither a full cache nor any persisted metadata for it. The
+    /// caller MUST surface this as an I/O error, never as an empty directory — a
+    /// truncated listing silently corrupts anything that trusts it (dedup tools,
+    /// backups, `rm -r`).
+    Unavailable,
+}
+
+#[cfg(test)]
+impl DirListing {
+    fn into_entries(self) -> Vec<(String, FileType)> {
+        match self {
+            DirListing::Complete(e) => e,
+            DirListing::Unavailable => Vec::new(),
+        }
+    }
+}
+
 pub struct NfsCacheFS {
     nas_path: PathBuf,
     cache_dir: PathBuf,
@@ -130,7 +155,9 @@ pub struct NfsCacheFS {
     /// Cached directory listings to avoid repeated NAS readdir calls.
     dir_list_cache: Mutex<HashMap<String, (Instant, Vec<(String, FileType)>)>>,
     /// Circuit breaker so FUSE callbacks never block on a hung NAS mount.
-    nas: NasHealth,
+    /// Shared (Arc) with the background metadata crawler so both agree on
+    /// reachability and never fight over a hung mount.
+    nas: Arc<NasHealth>,
     uid: u32,
     gid: u32,
 }
@@ -146,7 +173,7 @@ impl NfsCacheFS {
         let uid = unsafe { libc::getuid() };
         let gid = unsafe { libc::getgid() };
 
-        let nas = NasHealth::spawn(nas_path.clone(), NAS_OP_TIMEOUT, NAS_PROBE_INTERVAL);
+        let nas = Arc::new(NasHealth::spawn(nas_path.clone(), NAS_OP_TIMEOUT, NAS_PROBE_INTERVAL));
 
         // Pre-load cached directory names and pending writes from DB
         let mut initial_dirs = HashSet::new();
@@ -182,6 +209,11 @@ impl NfsCacheFS {
             uid,
             gid,
         }
+    }
+
+    /// A shareable handle to the reachability breaker, for the background crawler.
+    fn nas_handle(&self) -> Arc<NasHealth> {
+        self.nas.clone()
     }
 
     /// Check if an individual file exists in the local cache.
@@ -415,6 +447,9 @@ impl NfsCacheFS {
     /// Names to hide from directory listings (Synology metadata, macOS resource forks).
     fn is_hidden_entry(name: &str) -> bool {
         name == "@eaDir" || name == ".DS_Store" || name.starts_with("._") || name.contains("@Syno")
+            // In-flight/partial copy temp files (from safe_copy) — never surface
+            // them in listings or record them in the tree index.
+            || name.ends_with(".tmp")
     }
 
     /// Temp files that should not be tracked as pending NAS writes.
@@ -442,28 +477,35 @@ impl NfsCacheFS {
     }
 
     /// Read NAS directory entries through the breaker so a hung mount can't
-    /// block the FUSE thread. Merges into `entries`; a down/slow NAS is a no-op.
-    fn read_nas_dir_entries(&self, dir: &Path, entries: &mut HashMap<String, FileType>) {
+    /// block the FUSE thread. Merges into `entries`. Returns `true` if the NAS
+    /// answered (the listing is authoritative), `false` if the NAS was down or
+    /// the read timed out (nothing merged — caller must not trust `entries` as
+    /// complete).
+    fn read_nas_dir_entries(&self, dir: &Path, entries: &mut HashMap<String, FileType>) -> bool {
         let dir = dir.to_path_buf();
         let names = self.nas.run(move || read_dir_names(&dir));
-        if let Some(names) = names {
-            for (name, is_dir) in names {
-                if Self::is_hidden_entry(&name) {
-                    continue;
+        match names {
+            Some(names) => {
+                for (name, is_dir) in names {
+                    if Self::is_hidden_entry(&name) {
+                        continue;
+                    }
+                    let ft = if is_dir { FileType::Directory } else { FileType::RegularFile };
+                    entries.insert(name, ft);
                 }
-                let ft = if is_dir { FileType::Directory } else { FileType::RegularFile };
-                entries.insert(name, ft);
+                true
             }
+            None => false,
         }
     }
 
-    fn list_dir(&self, rel_path: &str) -> Vec<(String, FileType)> {
-        // Check in-memory cache first
+    fn list_dir(&self, rel_path: &str) -> DirListing {
+        // Check in-memory cache first — only complete listings are ever stored here.
         {
             let cache = self.dir_list_cache.lock().unwrap();
             if let Some((when, entries)) = cache.get(rel_path) {
                 if when.elapsed() < DIR_LIST_CACHE_TTL {
-                    return entries.clone();
+                    return DirListing::Complete(entries.clone());
                 }
             }
         }
@@ -471,17 +513,18 @@ impl NfsCacheFS {
         let mut entries: HashMap<String, FileType> = HashMap::new();
         let dir_is_cached = self.is_cached(rel_path);
 
-        // Skip NAS read if this directory is fully cached — serve from cache only
+        // Skip NAS read if this directory is fully cached — serve from cache only.
+        let mut nas_ok = false;
         if !dir_is_cached {
             let nas_dir = if rel_path.is_empty() {
                 self.nas_path.clone()
             } else {
                 self.nas_path.join(rel_path)
             };
-            self.read_nas_dir_entries(&nas_dir, &mut entries);
+            nas_ok = self.read_nas_dir_entries(&nas_dir, &mut entries);
         }
 
-        // Read from cache (overrides/merges with NAS for uncached dirs)
+        // Local cache files are present regardless of NAS state — always merge.
         let cache_dir = if rel_path.is_empty() {
             self.cache_dir.clone()
         } else {
@@ -489,14 +532,103 @@ impl NfsCacheFS {
         };
         Self::read_dir_entries(&cache_dir, &mut entries);
 
-        let mut result: Vec<(String, FileType)> = entries.into_iter().collect();
-        result.sort_by(|a, b| a.0.cmp(&b.0));
+        // We have an authoritative, complete listing only if the directory is
+        // fully cached locally or the NAS read *succeeded*. A failed read — for
+        // ANY reason (a timeout that trips the breaker, OR a fast soft-mount EIO
+        // that doesn't) — is never authoritative: `entries` then holds at most a
+        // handful of individually-cached files, which must not be presented as
+        // the whole directory. A successful *empty* read IS authoritative, since
+        // nas_ok is true in that case.
+        //
+        // NB: an earlier version gated this on the breaker's `is_up()` flag. That
+        // was wrong — a quick EIO leaves the breaker up, so truncated listings
+        // slipped through and photosync re-imported already-present photos.
+        let authoritative = dir_is_cached || nas_ok;
 
-        // Store in cache
-        self.dir_list_cache.lock().unwrap()
-            .insert(rel_path.to_string(), (Instant::now(), result.clone()));
+        if authoritative {
+            let mut result: Vec<(String, FileType)> = entries.into_iter().collect();
+            result.sort_by(|a, b| a.0.cmp(&b.0));
 
-        result
+            // Persist the structure whenever we learned it fresh from the NAS, so
+            // future outages can serve a complete listing of this directory.
+            if nas_ok {
+                if let Some(ref db) = self.db {
+                    let rows: Vec<(String, bool)> = result.iter()
+                        .map(|(n, ft)| (n.clone(), *ft == FileType::Directory))
+                        .collect();
+                    let db = db.lock().unwrap();
+                    if let Err(e) = db.replace_dir_listing(rel_path, &rows) {
+                        warn!("Failed to persist dir tree for {}: {}", rel_path, e);
+                    }
+                }
+            }
+
+            self.dir_list_cache.lock().unwrap()
+                .insert(rel_path.to_string(), (Instant::now(), result.clone()));
+
+            return DirListing::Complete(result);
+        }
+
+        // The NAS read failed and this directory isn't fully cached. Fall back to
+        // the last-known structure so a previously-seen tree still lists in full
+        // (a flaky mount must never look like an empty directory).
+        if let Some(ref db) = self.db {
+            let persisted = { db.lock().unwrap().get_dir_listing(rel_path) };
+            if let Ok(rows) = persisted {
+                if !rows.is_empty() {
+                    for (name, is_dir) in rows {
+                        if Self::is_hidden_entry(&name) {
+                            continue;
+                        }
+                        let ft = if is_dir { FileType::Directory } else { FileType::RegularFile };
+                        // Locally-cached files (already in `entries`) win — they're
+                        // definitely present and may be newer than the snapshot.
+                        entries.entry(name).or_insert(ft);
+                    }
+                    let mut result: Vec<(String, FileType)> = entries.into_iter().collect();
+                    result.sort_by(|a, b| a.0.cmp(&b.0));
+                    // Deliberately do NOT refresh the persisted snapshot or the
+                    // in-memory TTL cache from a stale read — the moment the NAS
+                    // returns we want a live listing, not this frozen one.
+                    return DirListing::Complete(result);
+                }
+            }
+        }
+
+        // Genuinely unknown: NAS down, not cached, never seen before.
+        DirListing::Unavailable
+    }
+
+    /// Look up a single entry in the persisted directory tree. Returns
+    /// `Some(is_dir)` when the entry was recorded on a previous NAS listing.
+    fn tree_entry(&self, parent_rel: &str, name: &str) -> Option<bool> {
+        let db = self.db.as_ref()?;
+        db.lock().unwrap().get_tree_entry(parent_rel, name).ok().flatten()
+    }
+
+    /// Synthesize a minimal attr for an entry we know from the tree metadata but
+    /// cannot stat right now (NAS down, bytes not cached). Directories browse
+    /// normally; files report size 0 — enough to appear in listings, though
+    /// their bytes can't be opened until the NAS returns.
+    fn make_synthetic_attr(&self, ino: INodeNo, is_dir: bool) -> FileAttr {
+        let now = SystemTime::now();
+        FileAttr {
+            ino,
+            size: 0,
+            blocks: 0,
+            atime: now,
+            mtime: now,
+            ctime: now,
+            crtime: now,
+            kind: if is_dir { FileType::Directory } else { FileType::RegularFile },
+            perm: if is_dir { 0o755 } else { 0o644 },
+            nlink: if is_dir { 2 } else { 1 },
+            uid: self.uid,
+            gid: self.gid,
+            rdev: 0,
+            blksize: 512,
+            flags: 0,
+        }
     }
 
     /// Invalidate the cached directory listing for a given directory.
@@ -551,6 +683,18 @@ impl Filesystem for NfsCacheFS {
         let (_resolved, meta) = match self.resolve_with_meta(&child_rel) {
             Some(r) => r,
             None => {
+                // Couldn't confirm the entry live. If the NAS is simply down,
+                // fall back to the last-known tree metadata so a previously-seen
+                // path still resolves during an outage. When the NAS is up, a
+                // miss is authoritative → ENOENT.
+                if !self.nas.is_up() {
+                    if let Some(is_dir) = self.tree_entry(&parent_rel, name_str) {
+                        let ino = self.inodes.lock().unwrap().get_or_create(&child_rel);
+                        let attr = self.make_synthetic_attr(INodeNo(ino), is_dir);
+                        reply.entry(&TTL, &attr, Generation(0));
+                        return;
+                    }
+                }
                 debug!("LOOKUP {} → ENOENT ({:.1}ms)", child_rel, t0.elapsed().as_secs_f64() * 1000.0);
                 reply.error(Errno::ENOENT);
                 return;
@@ -625,7 +769,23 @@ impl Filesystem for NfsCacheFS {
                 }
                 reply.attr(&TTL, &attr);
             }
-            None => reply.error(Errno::ENOENT),
+            None => {
+                // During a NAS outage, serve a synthetic attr for an entry we know
+                // from the tree metadata so `stat`/`ls -l` and directory walks keep
+                // working offline. NAS up → the miss is real → ENOENT.
+                if !self.nas.is_up() {
+                    if let (Some(parent), Some(name)) =
+                        (Self::parent_dir(&rel_path).or(Some("")), rel_path.rsplit('/').next())
+                    {
+                        if let Some(is_dir) = self.tree_entry(parent, name) {
+                            let attr = self.make_synthetic_attr(ino, is_dir);
+                            reply.attr(&TTL, &attr);
+                            return;
+                        }
+                    }
+                }
+                reply.error(Errno::ENOENT)
+            }
         }
     }
 
@@ -672,7 +832,18 @@ impl Filesystem for NfsCacheFS {
         entries.push((parent_ino, FileType::Directory, "..".to_string()));
 
         // Merged directory listing — lock inodes once for all children
-        let children = self.list_dir(&rel_path);
+        let children = match self.list_dir(&rel_path) {
+            DirListing::Complete(c) => c,
+            DirListing::Unavailable => {
+                // NAS unreachable and no cached/known listing. Return EIO rather
+                // than a truncated (empty) listing — a caller must be able to tell
+                // "couldn't read this directory" apart from "directory is empty".
+                warn!("READDIR {} → EIO (NAS unreachable, no cached listing)",
+                    if rel_path.is_empty() { "/" } else { &rel_path });
+                reply.error(Errno::EIO);
+                return;
+            }
+        };
         {
             let mut inodes = self.inodes.lock().unwrap();
             for (name, ft) in children {
@@ -1191,8 +1362,16 @@ impl Filesystem for NfsCacheFS {
         let child_rel = Self::join_rel(&parent_rel, name_str);
         info!("RMDIR: {}", child_rel);
 
-        // Check that merged directory is empty
-        let children = self.list_dir(&child_rel);
+        // Check that merged directory is empty. If we can't get a trustworthy
+        // listing (NAS unreachable), refuse rather than risk removing a directory
+        // whose contents we can't see.
+        let children = match self.list_dir(&child_rel) {
+            DirListing::Complete(c) => c,
+            DirListing::Unavailable => {
+                reply.error(Errno::EIO);
+                return;
+            }
+        };
         if !children.is_empty() {
             reply.error(Errno::ENOTEMPTY);
             return;
@@ -1535,6 +1714,81 @@ impl Filesystem for NfsCacheFS {
 
 /// Mount the NfsCacheFS at the given mount point.
 /// If the mount point is already a FUSE mount, unmount it first.
+/// Spawn a background thread that keeps the persistent directory-tree index
+/// (`dir_tree`) complete by periodically crawling the whole NAS structure.
+///
+/// This is metadata only — it lists directories, it never downloads file bytes.
+/// The payoff: the mount can present the entire tree at any depth, served from
+/// the index during NAS outages, and file contents are fetched lazily only when
+/// a file is actually opened.
+fn spawn_metadata_crawler(
+    nas_path: PathBuf,
+    db: Arc<Mutex<CacheDB>>,
+    nas: Arc<NasHealth>,
+    interval: Duration,
+) {
+    let _ = thread::Builder::new()
+        .name("nas-crawler".into())
+        .spawn(move || loop {
+            if nas.is_up() {
+                let t0 = Instant::now();
+                let n = crawl_tree(&nas_path, &nas, &db);
+                if n > 0 {
+                    info!(
+                        "Metadata crawl indexed {} directories in {:.1}s",
+                        n,
+                        t0.elapsed().as_secs_f64()
+                    );
+                }
+                thread::sleep(interval);
+            } else {
+                // NAS unreachable — check back soon rather than waiting a full cycle.
+                thread::sleep(Duration::from_secs(30));
+            }
+        });
+}
+
+/// Walk the entire NAS tree breadth-first (each read bounded by the breaker) and
+/// persist every directory's listing to `dir_tree`. Returns the number of
+/// directories indexed. A directory whose read fails right now is skipped, not
+/// emptied — its previously-indexed listing is left intact, and the crawl stops
+/// descending the moment the NAS goes down, so a hung mount never wipes the index.
+fn crawl_tree(nas_root: &Path, nas: &Arc<NasHealth>, db: &Arc<Mutex<CacheDB>>) -> usize {
+    let mut queue: std::collections::VecDeque<String> = std::collections::VecDeque::new();
+    queue.push_back(String::new()); // start at the root
+    let mut count = 0usize;
+
+    while let Some(rel) = queue.pop_front() {
+        if !nas.is_up() {
+            break; // NAS dropped mid-crawl; resume next cycle, keep what we have
+        }
+        let dir = if rel.is_empty() { nas_root.to_path_buf() } else { nas_root.join(&rel) };
+        let names = match nas.run(move || read_dir_names(&dir)) {
+            Some(n) => n,
+            None => continue, // unreadable right now — leave existing metadata intact
+        };
+
+        let mut rows: Vec<(String, bool)> = Vec::with_capacity(names.len());
+        for (name, is_dir) in &names {
+            if NfsCacheFS::is_hidden_entry(name) {
+                continue;
+            }
+            rows.push((name.clone(), *is_dir));
+            if *is_dir {
+                queue.push_back(NfsCacheFS::join_rel(&rel, name));
+            }
+        }
+
+        if let Ok(db) = db.lock() {
+            let _ = db.replace_dir_listing(&rel, &rows);
+        }
+        count += 1;
+        // Be gentle on a flaky NAS between directory reads.
+        thread::sleep(Duration::from_millis(20));
+    }
+    count
+}
+
 pub fn mount(
     nas_path: PathBuf,
     cache_dir: PathBuf,
@@ -1576,7 +1830,21 @@ pub fn mount(
         )
     };
 
-    let filesystem = NfsCacheFS::new(nas_path, cache_dir, db, Some(worker), Some(flush_worker));
+    let filesystem = NfsCacheFS::new(nas_path.clone(), cache_dir, db, Some(worker), Some(flush_worker));
+
+    // Background crawler: keep the full directory-tree index current so the mount
+    // can list every folder at any depth (served from the index during outages)
+    // while file contents stay download-on-open. Shares the FS breaker.
+    {
+        let crawl_db = CacheDB::open(db_path).expect("Failed to open crawler DB");
+        spawn_metadata_crawler(
+            nas_path,
+            Arc::new(Mutex::new(crawl_db)),
+            filesystem.nas_handle(),
+            Duration::from_secs(600),
+        );
+    }
+
     let mut config = Config::default();
     let vol_name = mount_point
         .file_name()
@@ -1693,7 +1961,7 @@ mod tests {
         fs::write(cache.join("b.jpg"), b"bbb").unwrap();
 
         let fs = NfsCacheFS::new(nas, cache, None, None, None);
-        let entries = fs.list_dir("");
+        let entries = fs.list_dir("").into_entries();
         let names: HashSet<String> = entries.into_iter().map(|(n, _)| n).collect();
         assert!(names.contains("a.jpg"));
         assert!(names.contains("b.jpg"));
@@ -1712,7 +1980,7 @@ mod tests {
         fs::write(cache.join("photo.jpg"), b"cache").unwrap();
 
         let fs = NfsCacheFS::new(nas, cache, None, None, None);
-        let entries = fs.list_dir("");
+        let entries = fs.list_dir("").into_entries();
         let names: Vec<String> = entries.into_iter().map(|(n, _)| n).collect();
         assert_eq!(names.iter().filter(|n| *n == "photo.jpg").count(), 1);
     }
@@ -1750,6 +2018,13 @@ mod tests {
         assert!(!NfsCacheFS::is_hidden_entry("IMG_001.jpg"));
         assert!(!NfsCacheFS::is_hidden_entry("March 2026"));
         assert!(!NfsCacheFS::is_hidden_entry(".hidden_dir"));
+    }
+
+    #[test]
+    fn test_is_hidden_entry_temp_files() {
+        assert!(NfsCacheFS::is_hidden_entry("DSC_0913.tmp"));
+        assert!(NfsCacheFS::is_hidden_entry("photo.jpg.tmp"));
+        assert!(!NfsCacheFS::is_hidden_entry("DSC_0913.dng"));
     }
 
     // --- is_file_cached tests ---
@@ -1910,10 +2185,163 @@ mod tests {
         fs::write(nas.join("._photo.jpg"), b"resource fork").unwrap();
 
         let fsys = NfsCacheFS::new(nas, cache, None, None, None);
-        let entries = fsys.list_dir("");
+        let entries = fsys.list_dir("").into_entries();
         let names: Vec<String> = entries.into_iter().map(|(n, _)| n).collect();
         assert!(names.contains(&"photo.jpg".to_string()));
         assert!(!names.contains(&"@eaDir".to_string()));
         assert!(!names.contains(&"._photo.jpg".to_string()));
+    }
+
+    // --- directory-listing reliability (tree metadata cache) ---
+
+    #[test]
+    fn test_list_dir_unavailable_when_nas_down_and_unknown() {
+        // NAS unreachable, directory never seen, not cached → must report
+        // Unavailable (→ EIO) rather than an empty listing. This is the bug that
+        // let photosync treat already-imported photos as "new".
+        let tmp = tempfile::TempDir::new().unwrap();
+        let cache = tmp.path().join("cache");
+        fs::create_dir_all(&cache).unwrap();
+        let nas = tmp.path().join("nonexistent-nas"); // never created → breaker starts down
+        let db = CacheDB::open(Path::new(":memory:")).unwrap();
+
+        let fsys = NfsCacheFS::new(nas, cache, Some(db), None, None);
+        assert!(!fsys.nas.is_up(), "breaker should start down for a missing NAS");
+        assert!(matches!(fsys.list_dir("2025"), DirListing::Unavailable));
+    }
+
+    #[test]
+    fn test_list_dir_persists_structure_from_live_nas() {
+        // A successful live listing records the directory structure so it can be
+        // served later without the NAS.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let nas = tmp.path().join("nas");
+        let cache = tmp.path().join("cache");
+        fs::create_dir_all(nas.join("2025/August")).unwrap();
+        fs::write(nas.join("2025/photo.jpg"), b"x").unwrap();
+        fs::create_dir_all(&cache).unwrap();
+        let db = CacheDB::open(Path::new(":memory:")).unwrap();
+
+        let fsys = NfsCacheFS::new(nas, cache, Some(db), None, None);
+        assert!(fsys.nas.is_up());
+        let _ = fsys.list_dir("2025").into_entries();
+
+        let mut listing = {
+            let db = fsys.db.as_ref().unwrap().lock().unwrap();
+            db.get_dir_listing("2025").unwrap()
+        };
+        listing.sort();
+        assert_eq!(listing, vec![
+            ("August".to_string(), true),
+            ("photo.jpg".to_string(), false),
+        ]);
+    }
+
+    #[test]
+    fn test_list_dir_serves_metadata_during_outage() {
+        // With structure already recorded, a NAS outage still yields a complete
+        // listing (from the persisted tree), not a truncated one.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let cache = tmp.path().join("cache");
+        fs::create_dir_all(&cache).unwrap();
+        let nas = tmp.path().join("nonexistent-nas"); // breaker down
+        let db = CacheDB::open(Path::new(":memory:")).unwrap();
+        db.replace_dir_listing("2025", &[
+            ("August".to_string(), true),
+            ("DSC_1.jpg".to_string(), false),
+        ]).unwrap();
+
+        let fsys = NfsCacheFS::new(nas, cache, Some(db), None, None);
+        assert!(!fsys.nas.is_up());
+        let entries = match fsys.list_dir("2025") {
+            DirListing::Complete(e) => e,
+            DirListing::Unavailable => panic!("expected a complete listing from tree metadata"),
+        };
+        let names: Vec<String> = entries.iter().map(|(n, _)| n.clone()).collect();
+        assert!(names.contains(&"August".to_string()));
+        assert!(names.contains(&"DSC_1.jpg".to_string()));
+    }
+
+    #[test]
+    fn test_list_dir_serves_metadata_when_live_read_fails_but_breaker_up() {
+        // Regression: a soft-mount EIO returns fast, so the breaker stays UP while
+        // the directory read still fails. list_dir must fall back to the index —
+        // not present an empty/truncated listing — or photosync re-imports.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let nas = tmp.path().join("nas");
+        let cache = tmp.path().join("cache");
+        fs::create_dir_all(&nas).unwrap(); // root exists → breaker starts UP
+        fs::create_dir_all(&cache).unwrap();
+        let db = CacheDB::open(Path::new(":memory:")).unwrap();
+        db.replace_dir_listing("2026/May", &[
+            ("DSC_0457.dng".to_string(), false),
+            ("DSC_0458.dng".to_string(), false),
+        ]).unwrap();
+
+        let fsys = NfsCacheFS::new(nas, cache, Some(db), None, None);
+        assert!(fsys.nas.is_up(), "breaker is up because the NAS root exists");
+        // nas/2026/May does NOT exist on disk → the live read fails (NotFound),
+        // fast, without tripping the breaker — the exact hole that leaked before.
+        let entries = match fsys.list_dir("2026/May") {
+            DirListing::Complete(e) => e,
+            DirListing::Unavailable => panic!("must serve the index, not fail"),
+        };
+        let names: Vec<String> = entries.iter().map(|(n, _)| n.clone()).collect();
+        assert!(names.contains(&"DSC_0457.dng".to_string()), "got {:?}", names);
+        assert!(names.contains(&"DSC_0458.dng".to_string()), "got {:?}", names);
+    }
+
+    #[test]
+    fn test_lookup_synthetic_attr_offline() {
+        // tree_entry + make_synthetic_attr: a known entry resolves offline.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let cache = tmp.path().join("cache");
+        fs::create_dir_all(&cache).unwrap();
+        let nas = tmp.path().join("nonexistent-nas");
+        let db = CacheDB::open(Path::new(":memory:")).unwrap();
+        db.replace_dir_listing("", &[("2025".to_string(), true)]).unwrap();
+
+        let fsys = NfsCacheFS::new(nas, cache, Some(db), None, None);
+        assert_eq!(fsys.tree_entry("", "2025"), Some(true));
+        assert_eq!(fsys.tree_entry("", "missing"), None);
+        let attr = fsys.make_synthetic_attr(INodeNo(42), true);
+        assert_eq!(attr.kind, FileType::Directory);
+        assert_eq!(attr.size, 0);
+    }
+
+    #[test]
+    fn test_crawl_tree_indexes_every_level() {
+        // The crawler records the whole tree — not just the top level — so the
+        // mount can list any folder at any depth without touching the NAS.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let nas = tmp.path().join("nas");
+        fs::create_dir_all(nas.join("2025/August")).unwrap();
+        fs::write(nas.join("2025/August/DSC_1.jpg"), b"x").unwrap();
+        fs::write(nas.join("2025/photo.jpg"), b"y").unwrap();
+        fs::create_dir_all(nas.join("2024/January")).unwrap();
+        fs::write(nas.join("2024/January/old.jpg"), b"z").unwrap();
+        // Synology metadata must be filtered out of the index.
+        fs::create_dir_all(nas.join("2025/@eaDir")).unwrap();
+
+        let nas_health = Arc::new(NasHealth::spawn(
+            nas.clone(),
+            Duration::from_secs(3),
+            Duration::from_secs(60),
+        ));
+        assert!(nas_health.is_up());
+        let db = Arc::new(Mutex::new(CacheDB::open(Path::new(":memory:")).unwrap()));
+
+        let n = crawl_tree(&nas, &nas_health, &db);
+        assert!(n >= 5, "expected root + 2024 + 2024/January + 2025 + 2025/August, got {}", n);
+
+        let db = db.lock().unwrap();
+        let mut root = db.get_dir_listing("").unwrap();
+        root.sort();
+        assert_eq!(root, vec![("2024".to_string(), true), ("2025".to_string(), true)]);
+        // Deep entries are indexed too.
+        assert_eq!(db.get_dir_listing("2025/August").unwrap(), vec![("DSC_1.jpg".to_string(), false)]);
+        assert_eq!(db.get_tree_entry("2024", "January").unwrap(), Some(true));
+        // Hidden metadata is not indexed.
+        assert_eq!(db.get_tree_entry("2025", "@eaDir").unwrap(), None);
     }
 }

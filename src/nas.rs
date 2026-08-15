@@ -33,7 +33,27 @@ impl NasHealth {
     /// `op_timeout` caps how long a single FUSE-thread NAS call may block.
     /// `probe_interval` is how often the background thread re-checks the NAS.
     pub fn spawn(nas_root: PathBuf, op_timeout: Duration, probe_interval: Duration) -> Self {
-        let initial = probe_bounded(&nas_root, op_timeout);
+        // Production: the NAS is only "up" when its root is both reachable and a
+        // real network mount (never a local underlay). Under `cargo test` the
+        // mount check is bypassed so the wider filesystem tests can run against
+        // local temp dirs; `is_network_mount` itself is tested directly.
+        #[cfg(not(test))]
+        let valid: fn(&Path) -> bool = is_network_mount;
+        #[cfg(test)]
+        let valid: fn(&Path) -> bool = |_| true;
+        Self::spawn_validated(nas_root, op_timeout, probe_interval, valid)
+    }
+
+    /// Like `spawn`, but with an injectable "is this a valid NAS mount?" check.
+    /// Tests pass `|_| true` to exercise the breaker mechanics against a local
+    /// temp dir (which is not a real network mount).
+    fn spawn_validated(
+        nas_root: PathBuf,
+        op_timeout: Duration,
+        probe_interval: Duration,
+        valid: fn(&Path) -> bool,
+    ) -> Self {
+        let initial = probe_bounded(&nas_root, op_timeout, valid);
         if initial {
             info!("NAS reachable: {}", nas_root.display());
         } else {
@@ -55,7 +75,7 @@ impl NasHealth {
                 .name("nas-health".into())
                 .spawn(move || loop {
                     thread::sleep(probe_interval);
-                    let ok = std::fs::metadata(&nas_root).is_ok();
+                    let ok = std::fs::metadata(&nas_root).is_ok() && valid(&nas_root);
                     let was = up.swap(ok, Ordering::SeqCst);
                     if was != ok {
                         if ok {
@@ -133,15 +153,41 @@ impl NasHealth {
     }
 }
 
+/// True only if `path` is served by a *network* filesystem (NFS/SMB/AFP), not a
+/// local disk.
+///
+/// This guards a nasty failure mode: when an NFS mount drops, its mount-point
+/// reverts to an ordinary local directory (the "underlay"). Writes there appear
+/// to succeed but silently strand data on the Mac's disk instead of the NAS —
+/// and because the write *did* succeed, we'd clear the pending flag and believe
+/// the file was synced. Refusing to treat the underlay as the NAS prevents that.
+pub fn is_network_mount(path: &Path) -> bool {
+    use std::os::unix::ffi::OsStrExt;
+    let c_path = match std::ffi::CString::new(path.as_os_str().as_bytes()) {
+        Ok(p) => p,
+        Err(_) => return false,
+    };
+    let mut buf: libc::statfs = unsafe { std::mem::zeroed() };
+    if unsafe { libc::statfs(c_path.as_ptr(), &mut buf) } != 0 {
+        return false; // can't stat → not safe to treat as a mounted NAS
+    }
+    let fstype = unsafe { std::ffi::CStr::from_ptr(buf.f_fstypename.as_ptr()) };
+    matches!(fstype.to_bytes(), b"nfs" | b"smbfs" | b"afpfs")
+}
+
 /// One-shot bounded probe used to set the initial state without ever blocking
 /// startup (important when launchd starts us before the VPN/NAS is up).
-fn probe_bounded(nas_root: &Path, timeout: Duration) -> bool {
+///
+/// The NAS counts as "up" only when its root both resolves AND is a real network
+/// mount — a bare local underlay (mount dropped) reports down, so we serve cache
+/// and never flush into it.
+fn probe_bounded(nas_root: &Path, timeout: Duration, valid: fn(&Path) -> bool) -> bool {
     let (tx, rx) = mpsc::channel();
     let root = nas_root.to_path_buf();
     if thread::Builder::new()
         .name("nas-probe".into())
         .spawn(move || {
-            let _ = tx.send(std::fs::metadata(&root).is_ok());
+            let _ = tx.send(std::fs::metadata(&root).is_ok() && valid(&root));
         })
         .is_err()
     {
@@ -157,10 +203,13 @@ mod tests {
     #[test]
     fn up_when_root_exists() {
         let tmp = tempfile::TempDir::new().unwrap();
-        let health = NasHealth::spawn(
+        // Bypass the network-mount requirement so we can exercise the breaker
+        // mechanics against a local temp dir (which is not a real NFS mount).
+        let health = NasHealth::spawn_validated(
             tmp.path().to_path_buf(),
             Duration::from_secs(2),
             Duration::from_secs(60),
+            |_| true,
         );
         assert!(health.is_up());
         // A real file resolves through the breaker.
@@ -169,6 +218,32 @@ mod tests {
         // A missing file returns None without tripping the breaker.
         assert!(health.metadata(&tmp.path().join("missing.txt")).is_none());
         assert!(health.is_up());
+    }
+
+    #[test]
+    fn local_dir_is_not_a_network_mount() {
+        // The safety-critical direction: a local directory (e.g. an unmounted
+        // mount-point's underlay) must never be mistaken for the mounted NAS.
+        let tmp = tempfile::TempDir::new().unwrap();
+        assert!(!is_network_mount(tmp.path()));
+        assert!(!is_network_mount(&tmp.path().join("also/local")));
+        assert!(!is_network_mount(PathBuf::from("/nonexistent/path").as_path()));
+    }
+
+    #[test]
+    fn breaker_down_on_local_underlay() {
+        // Even though the path exists and is readable, it's a local dir, so with
+        // the REAL mount check the breaker must report the NAS as down (don't
+        // flush into an underlay). We wire in `is_network_mount` explicitly here
+        // because the default `spawn` bypasses it under `cfg(test)`.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let health = NasHealth::spawn_validated(
+            tmp.path().to_path_buf(),
+            Duration::from_secs(2),
+            Duration::from_secs(60),
+            is_network_mount,
+        );
+        assert!(!health.is_up(), "a local dir must not be treated as a mounted NAS");
     }
 
     #[test]

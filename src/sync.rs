@@ -1,5 +1,6 @@
 // src/sync.rs
 use crate::cache_db::CacheDB;
+use crate::nas::NasHealth;
 use log::{debug, info, warn};
 use sha2::{Sha256, Digest};
 use std::collections::HashMap;
@@ -13,10 +14,32 @@ use std::thread;
 use std::time::Duration;
 use walkdir::WalkDir;
 
+/// Bounds a single NAS reachability probe from the flush worker.
+const FLUSH_NAS_OP_TIMEOUT: Duration = Duration::from_secs(3);
+/// How often the flush worker re-checks NAS reachability.
+const FLUSH_NAS_PROBE_INTERVAL: Duration = Duration::from_secs(5);
+
 const PHOTO_EXTENSIONS: &[&str] = &[
     "jpg", "jpeg", "png", "heic", "heif", "dng", "raw", "tiff", "tif", "cr2", "nef", "arw",
     "aae", "xmp", "mov",
 ];
+
+/// Whether `nas_path` is a real (network) NAS mount rather than a dropped
+/// mount's local underlay. Gates every destructive/write NAS operation so we
+/// never strand data on, or purge the cache because of, a local underlay.
+///
+/// In production this is `crate::nas::is_network_mount`. Under `cargo test` it
+/// defaults to `true` so the worker/cleanup logic can be exercised against local
+/// temp dirs (unit tests can't create real NFS mounts); the real check is
+/// covered by `nas::tests`.
+#[cfg(not(test))]
+fn nas_is_mounted(path: &Path) -> bool {
+    crate::nas::is_network_mount(path)
+}
+#[cfg(test)]
+fn nas_is_mounted(_path: &Path) -> bool {
+    true
+}
 
 fn is_photo(path: &Path) -> bool {
     if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
@@ -356,7 +379,10 @@ pub fn cleanup_stale_state(nas_path: &Path, cache_dir: &Path, db: &CacheDB) {
     //    unreachable, and `Path::exists()` collapses "timed out" into `false` —
     //    so the old code treated a network blip as mass deletion and destroyed
     //    the cache. Here, any uncertainty means we keep the cached copy.
-    if nas_path.is_dir() {
+    //
+    //    Also require the NAS to be a real network mount: against a dropped
+    //    mount's local underlay every file would look ENOENT and get purged.
+    if nas_path.is_dir() && nas_is_mounted(nas_path) {
         let cached_paths = db.all_cached_paths().unwrap_or_default();
         let pending = db.all_pending_writes().unwrap_or_default();
         let pending_set: std::collections::HashSet<&str> = pending.iter().map(|s| s.as_str()).collect();
@@ -548,6 +574,15 @@ impl WriteFlushWorker {
         let (invalidated_tx, invalidated_rx) = mpsc::channel::<String>();
 
         let handle = thread::spawn(move || {
+            // The flush worker's own reachability breaker. It gates writes exactly
+            // as the FUSE reads are gated: don't touch the NAS unless it's a real
+            // mount AND currently responsive. Hammering a timing-out NAS just
+            // leaves a trail of partial `.tmp` files that can't be cleaned up.
+            let nas = NasHealth::spawn(
+                nas_path.clone(),
+                FLUSH_NAS_OP_TIMEOUT,
+                FLUSH_NAS_PROBE_INTERVAL,
+            );
             let mut cycle_count = 0u64;
             let mut retry_counts: HashMap<String, u32> = HashMap::new();
             const MAX_BACKOFF_CYCLES: u32 = 64; // cap at ~5 min with 5s interval
@@ -562,6 +597,19 @@ impl WriteFlushWorker {
                 };
                 if pending.is_empty() {
                     retry_counts.clear();
+                    continue;
+                }
+
+                // Only flush when the NAS is a real mount AND currently responsive
+                // (the breaker folds in `is_network_mount`). This defers writes
+                // during an outage instead of repeatedly writing partial `.tmp`
+                // files to a timing-out NAS — and never strands data in a dropped
+                // mount's local underlay. Files stay pending and safe in cache.
+                if !nas.is_up() {
+                    debug!(
+                        "NAS unreachable — deferring {} pending flush(es) (avoids partial .tmp writes)",
+                        pending.len()
+                    );
                     continue;
                 }
 
@@ -640,7 +688,9 @@ impl WriteFlushWorker {
                 // parent must be listable and report ENOENT for this dir. A soft
                 // NFS mount returns timeouts when unreachable; treating those as
                 // removals would wipe live cached directories during a blip.
-                if cycle_count % 12 == 0 {
+                // And never run this against a local underlay (mount dropped),
+                // where every NAS dir would falsely look deleted.
+                if cycle_count % 12 == 0 && nas.is_up() {
                     let db_guard = db.lock().unwrap();
                     if let Ok(dirs) = db_guard.lru_directories() {
                         for dir in &dirs {
