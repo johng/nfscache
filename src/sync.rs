@@ -722,10 +722,16 @@ impl WriteFlushWorker {
                     }
                     attempted += 1;
                 }
-                if any_succeeded {
-                    // Network is back — reset all backoff so remaining files retry next cycle
-                    retry_counts.clear();
-                }
+                // NOTE: do *not* clear `retry_counts` here on `any_succeeded`.
+                // A flapping NAS produces cycles where some files flush and others
+                // time out; wiping every count on any success reset each failing
+                // file's counter to 0 every cycle — so persistent failures logged
+                // "retry #1" forever and the exponential backoff never escalated,
+                // letting a genuinely-stuck file hog every up-window. Prompt retry
+                // after recovery is already handled in-loop: once a file succeeds,
+                // `any_succeeded` bypasses backoff for the remaining files this
+                // cycle. A file's count is reset only when that file itself flushes
+                // (see the success arm) or is no longer pending (retain/remove).
                 if attempted > 0 {
                     info!("Flush cycle: attempted {} of {} pending writes", attempted, pending.len());
                 }
