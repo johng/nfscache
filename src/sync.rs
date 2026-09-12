@@ -5,7 +5,7 @@ use log::{debug, info, warn};
 use sha2::{Sha256, Digest};
 use std::collections::HashMap;
 use std::fs::{self, File};
-use std::io::{self, Read as _};
+use std::io::{self, Read as _, Write as _};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 use std::sync::Arc;
@@ -64,62 +64,115 @@ pub struct CopyResult {
     pub checksum: String,
 }
 
-/// Compute SHA-256 hex digest of a file.
-fn sha256_file(path: &Path) -> io::Result<String> {
-    let mut file = File::open(path)?;
-    let mut hasher = Sha256::new();
-    let mut buf = [0u8; 64 * 1024];
-    loop {
-        let n = file.read(&mut buf)?;
-        if n == 0 {
-            break;
-        }
-        hasher.update(&buf[..n]);
-    }
-    Ok(format!("{:x}", hasher.finalize()))
+/// The temp path a `safe_copy` writes to for `dst`: the destination name with a
+/// `.tmp` suffix appended (e.g. `DSC_0918.dng` -> `DSC_0918.dng.tmp`). Appending
+/// keeps it unique per destination — `with_extension("tmp")` would map both
+/// `DSC_0918.dng` and a sibling `DSC_0918.jpg` (RAW+JPEG pairs) to the same
+/// `DSC_0918.tmp` and let concurrent flushes clobber each other.
+fn tmp_path(dst: &Path) -> PathBuf {
+    let mut name = dst.file_name().unwrap_or_default().to_os_string();
+    name.push(".tmp");
+    dst.with_file_name(name)
 }
 
-/// Copy a file safely: write to a temp file, verify size, compute checksum, then
-/// atomically rename to the final destination. Returns size and checksum on success.
-/// On failure, the temp file is cleaned up and no partial file is left at `dst`.
-fn safe_copy(src: &Path, dst: &Path) -> io::Result<CopyResult> {
-    let tmp = dst.with_extension("tmp");
+/// The macOS AppleDouble sidecar (`._name`) that shadows `p`, if `p` has a name.
+fn appledouble_sibling(p: &Path) -> Option<PathBuf> {
+    let name = p.file_name()?.to_str()?;
+    Some(p.with_file_name(format!("._{}", name)))
+}
 
-    // Copy to temp file
-    let size = match fs::copy(src, &tmp) {
-        Ok(s) => s,
+/// Remove a temp file and any AppleDouble sidecar beside it, ignoring errors.
+fn remove_tmp(tmp: &Path) {
+    let _ = fs::remove_file(tmp);
+    if let Some(sidecar) = appledouble_sibling(tmp) {
+        let _ = fs::remove_file(sidecar);
+    }
+}
+
+/// Copy a file safely: stream to a temp file, verify size, then atomically rename
+/// to the final destination. Returns size and SHA-256 (of the bytes written) on
+/// success. On failure, the temp file (and its AppleDouble sidecar) are cleaned
+/// up and no partial file is left at `dst`.
+///
+/// We stream the copy by hand rather than calling `fs::copy`. On macOS `fs::copy`
+/// uses `copyfile(COPYFILE_ALL)`, which replicates the source's extended
+/// attributes (e.g. `com.apple.provenance`) onto the destination. An NFS mount
+/// has no native xattr support, so macOS spills those into an AppleDouble `._`
+/// sidecar file next to every copy — one turd per photo, forever, and never
+/// reaped. A plain data copy sets no xattrs, so no `._` file is created. We hash
+/// the bytes as we write them, which also avoids reading the freshly-written file
+/// back over the (frequently timing-out) NAS just to checksum it.
+fn safe_copy(src: &Path, dst: &Path) -> io::Result<CopyResult> {
+    let tmp = tmp_path(dst);
+
+    let src_size = fs::metadata(src)?.len();
+
+    let mut reader = File::open(src)?;
+    let mut writer = match File::create(&tmp) {
+        Ok(w) => w,
         Err(e) => {
-            let _ = fs::remove_file(&tmp);
+            remove_tmp(&tmp);
             return Err(e);
         }
     };
 
-    // Verify size matches source
-    let src_size = fs::metadata(src)?.len();
-    if size != src_size {
-        let _ = fs::remove_file(&tmp);
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!("size mismatch: copied {} bytes but source is {} bytes", size, src_size),
-        ));
+    let mut hasher = Sha256::new();
+    let mut buf = [0u8; 256 * 1024];
+    let mut written: u64 = 0;
+    loop {
+        let n = match reader.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => n,
+            Err(e) => {
+                drop(writer);
+                remove_tmp(&tmp);
+                return Err(e);
+            }
+        };
+        if let Err(e) = writer.write_all(&buf[..n]) {
+            drop(writer);
+            remove_tmp(&tmp);
+            return Err(e);
+        }
+        hasher.update(&buf[..n]);
+        written += n as u64;
+    }
+    if let Err(e) = writer.flush() {
+        drop(writer);
+        remove_tmp(&tmp);
+        return Err(e);
+    }
+    drop(writer);
+
+    // Verify the temp on the NAS is exactly the size we streamed (catches a
+    // truncated write from a mid-copy timeout before we commit the rename).
+    match fs::metadata(&tmp) {
+        Ok(m) if m.len() == written && written == src_size => {}
+        Ok(m) => {
+            remove_tmp(&tmp);
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "size mismatch: source {} bytes, wrote {} bytes, temp is {} bytes",
+                    src_size, written, m.len()
+                ),
+            ));
+        }
+        Err(e) => {
+            remove_tmp(&tmp);
+            return Err(e);
+        }
     }
 
-    // Compute checksum of the copied file
-    let checksum = match sha256_file(&tmp) {
-        Ok(c) => c,
-        Err(e) => {
-            let _ = fs::remove_file(&tmp);
-            return Err(e);
-        }
-    };
+    let checksum = format!("{:x}", hasher.finalize());
 
     // Atomic rename to final destination
     if let Err(e) = fs::rename(&tmp, dst) {
-        let _ = fs::remove_file(&tmp);
+        remove_tmp(&tmp);
         return Err(e);
     }
 
-    Ok(CopyResult { size, checksum })
+    Ok(CopyResult { size: written, checksum })
 }
 
 /// Cache a single directory from NAS to local cache.
@@ -646,9 +699,9 @@ impl WriteFlushWorker {
                         fs::create_dir_all(parent).ok();
                     }
 
-                    // Clean up any partial file from a previous failed attempt
-                    let tmp = dst.with_extension("tmp");
-                    let _ = fs::remove_file(&tmp);
+                    // Clean up any partial temp (and its AppleDouble sidecar)
+                    // left on the NAS by a previous failed attempt.
+                    remove_tmp(&tmp_path(&dst));
 
                     // Safe copy: temp file + size verify + checksum + atomic rename
                     match safe_copy(&src, &dst) {
@@ -764,6 +817,54 @@ mod tests {
 
         let db = CacheDB::open(Path::new(":memory:")).unwrap();
         (nas_dir, cache_dir, db)
+    }
+
+    #[test]
+    fn test_tmp_path_appends_suffix() {
+        // Append, don't replace the extension: a RAW+JPEG pair sharing a stem
+        // must not collide on one temp name.
+        assert_eq!(tmp_path(Path::new("/a/DSC_0918.dng")), Path::new("/a/DSC_0918.dng.tmp"));
+        assert_eq!(tmp_path(Path::new("/a/DSC_0918.jpg")), Path::new("/a/DSC_0918.jpg.tmp"));
+        assert_ne!(tmp_path(Path::new("/a/DSC_0918.dng")), tmp_path(Path::new("/a/DSC_0918.jpg")));
+    }
+
+    #[test]
+    fn test_safe_copy_roundtrip_and_no_readback_needed() {
+        let dir = TempDir::new().unwrap();
+        let src = dir.path().join("src.dng");
+        let dst = dir.path().join("sub/dst.dng");
+        fs::create_dir_all(dst.parent().unwrap()).unwrap();
+        let data = vec![b'z'; 200_000]; // spans multiple 256 KiB-buffer reads' boundary logic
+        fs::write(&src, &data).unwrap();
+
+        let result = safe_copy(&src, &dst).unwrap();
+        assert_eq!(result.size, data.len() as u64);
+        assert_eq!(fs::read(&dst).unwrap(), data);
+        // Checksum is the SHA-256 of the copied bytes.
+        let mut h = Sha256::new();
+        h.update(&data);
+        assert_eq!(result.checksum, format!("{:x}", h.finalize()));
+        // No temp file is left behind on success.
+        assert!(!tmp_path(&dst).exists());
+    }
+
+    #[test]
+    fn test_safe_copy_cleans_temp_and_sidecar_on_failure() {
+        let dir = TempDir::new().unwrap();
+        let dst = dir.path().join("dst.dng");
+        // Missing source => copy fails; no temp or sidecar should survive.
+        let err = safe_copy(&dir.path().join("does_not_exist.dng"), &dst);
+        assert!(err.is_err());
+        assert!(!tmp_path(&dst).exists());
+        assert!(!dst.exists());
+
+        // remove_tmp also reaps a stray AppleDouble sidecar left by an older run.
+        let tmp = tmp_path(&dst);
+        fs::write(&tmp, b"partial").unwrap();
+        fs::write(appledouble_sibling(&tmp).unwrap(), b"\x00\x05\x16\x07").unwrap();
+        remove_tmp(&tmp);
+        assert!(!tmp.exists());
+        assert!(!appledouble_sibling(&tmp).unwrap().exists());
     }
 
     #[test]
