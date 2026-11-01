@@ -19,3 +19,7 @@ dirs = "6"
 [dev-dependencies]
 tempfile = "3"
 filetime = "0.2"
+
+# macFUSE >= 5.3 breaks fuser's fuse_mount_compat25 path; see vendor/fuser/VENDORED.md
+[patch.crates-io]
+fuser = { path = "vendor/fuser" }
