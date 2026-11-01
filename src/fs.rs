@@ -24,6 +24,10 @@ const TTL: Duration = Duration::from_secs(30);
 const DIR_LIST_CACHE_TTL: Duration = Duration::from_secs(30);
 /// Max time a single FUSE-thread NAS call may block before the breaker trips.
 const NAS_OP_TIMEOUT: Duration = Duration::from_secs(3);
+/// Directory listings get longer: a cold listing of a big folder over a VPN can
+/// legitimately take several seconds, and timing out turns a healthy NAS into an
+/// EIO for the caller (e.g. photosync aborting). Roughly the soft-NFS give-up time.
+const NAS_READDIR_TIMEOUT: Duration = Duration::from_secs(10);
 /// How often the background health thread re-checks NAS reachability.
 const NAS_PROBE_INTERVAL: Duration = Duration::from_secs(5);
 const ROOT_INO: u64 = 1;
@@ -483,7 +487,7 @@ impl NfsCacheFS {
     /// complete).
     fn read_nas_dir_entries(&self, dir: &Path, entries: &mut HashMap<String, FileType>) -> bool {
         let dir = dir.to_path_buf();
-        let names = self.nas.run(move || read_dir_names(&dir));
+        let names = self.nas.run_with_timeout(NAS_READDIR_TIMEOUT, move || read_dir_names(&dir));
         match names {
             Some(names) => {
                 for (name, is_dir) in names {
@@ -1763,7 +1767,7 @@ fn crawl_tree(nas_root: &Path, nas: &Arc<NasHealth>, db: &Arc<Mutex<CacheDB>>) -
             break; // NAS dropped mid-crawl; resume next cycle, keep what we have
         }
         let dir = if rel.is_empty() { nas_root.to_path_buf() } else { nas_root.join(&rel) };
-        let names = match nas.run(move || read_dir_names(&dir)) {
+        let names = match nas.run_with_timeout(NAS_READDIR_TIMEOUT, move || read_dir_names(&dir)) {
             Some(n) => n,
             None => continue, // unreadable right now — leave existing metadata intact
         };

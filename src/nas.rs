@@ -112,6 +112,18 @@ impl NasHealth {
         F: FnOnce() -> std::io::Result<T> + Send + 'static,
         T: Send + 'static,
     {
+        self.run_with_timeout(self.op_timeout, f)
+    }
+
+    /// Like [`run`](Self::run) but with a caller-chosen timeout. Use a longer
+    /// one for operations that are legitimately slow on a healthy-but-distant
+    /// NAS (e.g. a cold listing of a large directory over a VPN), so they don't
+    /// trip the breaker and surface as EIO while the NAS is actually fine.
+    pub fn run_with_timeout<T, F>(&self, timeout: Duration, f: F) -> Option<T>
+    where
+        F: FnOnce() -> std::io::Result<T> + Send + 'static,
+        T: Send + 'static,
+    {
         // Breaker open: don't even touch the NAS.
         if !self.is_up() {
             return None;
@@ -130,7 +142,7 @@ impl NasHealth {
         {
             return None;
         }
-        match rx.recv_timeout(self.op_timeout) {
+        match rx.recv_timeout(timeout) {
             Ok(Ok(v)) => Some(v),
             Ok(Err(_)) => None, // NAS answered, but the op failed (e.g. ENOENT)
             Err(mpsc::RecvTimeoutError::Timeout) => {
@@ -244,6 +256,33 @@ mod tests {
             is_network_mount,
         );
         assert!(!health.is_up(), "a local dir must not be treated as a mounted NAS");
+    }
+
+    #[test]
+    fn slow_op_succeeds_with_longer_timeout_without_tripping() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let health = NasHealth::spawn_validated(
+            tmp.path().to_path_buf(),
+            Duration::from_millis(100),
+            Duration::from_secs(60),
+            |_| true,
+        );
+        assert!(health.is_up());
+        // An op slower than op_timeout but within the per-call timeout completes
+        // and leaves the breaker closed.
+        let got = health.run_with_timeout(Duration::from_secs(2), || {
+            std::thread::sleep(Duration::from_millis(400));
+            Ok(7)
+        });
+        assert_eq!(got, Some(7));
+        assert!(health.is_up());
+        // The same op under the short default timeout trips the breaker.
+        let got = health.run(|| {
+            std::thread::sleep(Duration::from_millis(400));
+            Ok(7)
+        });
+        assert_eq!(got, None);
+        assert!(!health.is_up());
     }
 
     #[test]
