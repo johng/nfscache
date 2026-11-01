@@ -31,7 +31,7 @@ sudo mount -t nfs -o vers=3,nolock,resvport 192.168.50.21:/volume1/media ~/nas_m
 nfscache mount
 ```
 
-Open `~/NAS Pictures` in Finder. Directories cache automatically as you browse.
+Open `~/nas_pictures` in Finder. Directories cache automatically as you browse.
 
 ## Make targets
 
@@ -73,7 +73,7 @@ Config is created at `~/.nfscache/config.json` on first `init`:
   "nas_photos_path": "/Users/johng/nas_media/photos",
   "cache_dir": "/Users/johng/.nfscache/data",
   "db_path": "/Users/johng/.nfscache/cache.db",
-  "mount_point": "/Users/johng/NAS Pictures",
+  "mount_point": "/Users/johng/nas_pictures",
   "max_cache_bytes": 53687091200
 }
 ```
@@ -105,7 +105,7 @@ Service logs: `~/Library/Logs/nfscache/`
 ## How it works
 
 ```
-~/NAS Pictures (FUSE mount)
+~/nas_pictures (FUSE mount)
 
   Reads:    cache hit  --> local disk (fast)
             cache miss --> NAS (transparent)
